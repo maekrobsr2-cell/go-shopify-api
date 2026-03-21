@@ -410,7 +410,10 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 	attemptToken := fmt.Sprintf("%s-%s", cs.CheckoutToken, uuid.New().String()[:10])
 
 	// Build delivery line config with full address
-	deliveryLine := cs.buildDeliveryLine(cs.ShippingHandle, false, cs.MerchandiseID, true, true)
+	// destinationChanged=true tells Shopify to accept our delivery details as fresh,
+	// preventing DELIVERY_DELIVERY_LINE_DETAIL_CHANGED errors when details shift
+	// between Step 3 proposal and Step 4 submit.
+	deliveryLine := cs.buildDeliveryLine(cs.ShippingHandle, true, cs.MerchandiseID, true, true)
 
 	billingAddr := cs.billingAddress()
 
@@ -420,18 +423,11 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 		expLines = append(expLines, map[string]string{"signedHandle": exp["signedHandle"]})
 	}
 
-	// Payment amounts: use actual total if available, otherwise {"any": true} fallback
-	// This matches neww.py lines 3656-3661 exactly
-	var paymentTotalAmount any
-	var paymentLineAmount any
-	if cs.ActualTotal != "" {
-		paymentTotalAmount = map[string]any{"value": map[string]any{"amount": cs.ActualTotal, "currencyCode": "USD"}}
-		paymentLineAmount = map[string]any{"value": map[string]any{"amount": cs.ActualTotal, "currencyCode": "USD"}}
-	} else {
-		fmt.Println("  [SUBMIT] No total amount — using {any: true} fallback")
-		paymentTotalAmount = map[string]any{"any": true}
-		paymentLineAmount = map[string]any{"any": true}
-	}
+	// Payment amounts: always use {any: true} to accept whatever currency/amount
+	// Shopify expects. Hardcoding USD breaks international stores (MYR, ZAR, etc.)
+	// and causes PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT on every non-USD site.
+	paymentTotalAmount := map[string]any{"any": true}
+	paymentLineAmount := map[string]any{"any": true}
 
 	inputData := map[string]any{
 		"sessionInput": map[string]any{"sessionToken": cs.SessionToken},

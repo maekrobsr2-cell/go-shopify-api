@@ -20,11 +20,11 @@ var cfg = struct {
 	SiteRemoval        bool
 	SingleProxyAttempt bool
 }{
-	ParallelWorkers:    16,
+	ParallelWorkers:    32,
 	StaggerMinMS:       100,
 	StaggerMaxMS:       300,
-	HTTPTimeoutShort:   8 * time.Second,
-	HTTPTimeoutMedium:  12 * time.Second,
+	HTTPTimeoutShort:   5 * time.Second,
+	HTTPTimeoutMedium:  8 * time.Second,
 	PollReceiptMax:     10,
 	ShortSleep:         400 * time.Millisecond,
 	MaxWaitSeconds:     1.5,

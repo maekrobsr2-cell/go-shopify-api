@@ -352,9 +352,9 @@ func processSingleMultiSite(cardLine string, sites []string, proxyStr string, pr
 		product   *Product
 	}
 
-	maxCheckoutSlots := 8
+	maxCheckoutSlots := 6
 	probeCh := make(chan probeResult, len(shuffled))
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 8*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 
 	var deadMu sync.Mutex
 	var allPermDeadSites []string
@@ -401,7 +401,7 @@ func processSingleMultiSite(cardLine string, sites []string, proxyStr string, pr
 				probeProxy = proxyPool[probeIdx%len(proxyPool)]
 			}
 			fp := randomFingerprint()
-			client := newClient(fp, probeProxy, 8*time.Second)
+			client := newClient(fp, probeProxy, 5*time.Second)
 			p := autoDetectProduct(client, shopURL, fp)
 
 			if p != nil {
@@ -516,7 +516,7 @@ startPhase2:
 		viable = viable[:maxViable]
 	}
 
-	numWorkers := min(4, len(viable))
+	numWorkers := min(6, len(viable))
 	fmt.Fprintf(os.Stderr, "[SINGLE] Phase 2: %d workers, %d sites queued\n",
 		numWorkers, len(viable))
 
@@ -535,7 +535,7 @@ startPhase2:
 	}
 
 	checkoutCh := make(chan checkoutOutcome, len(viable))
-	checkoutCtx, checkoutCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	checkoutCtx, checkoutCancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer checkoutCancel()
 
 	var wg sync.WaitGroup
@@ -574,7 +574,7 @@ startPhase2:
 						siteLabel, product.PriceStr)
 
 					fp := randomFingerprint()
-					client := newClient(fp, currentProxy, 12*time.Second)
+					client := newClient(fp, currentProxy, 8*time.Second)
 
 					cs := &CheckoutSession{
 						Client:    client,
@@ -750,13 +750,13 @@ startPhase2:
 							break // site issue → next site
 						}
 						if status == "site_skip" {
-							fmt.Fprintf(os.Stderr, "[P2] [%s] site_skip: %s → skipping + temp_dead (no permanent removal)\n", siteLabel, code)
+							fmt.Fprintf(os.Stderr, "[P2] [%s] site_skip: %s → skip to next site\n", siteLabel, code)
 							deadMu.Lock()
 							allTempDeadSites = append(allTempDeadSites, shopURL)
 							allSiteSkipReasons[shopURL] = code
 							deadMu.Unlock()
 							lastFailInfo = fmt.Sprintf("%s:Step4:%s", siteLabel, code)
-							break // skip to next site, but do NOT permanently kill
+							break // skip to next site — worker picks next from queue
 						}
 						// Card-level result → terminal
 						// If "charged" at Step4 (no receipt), verify site is real first
@@ -1073,7 +1073,7 @@ func classifySingleCode(code string) string {
 	skipSiteTokens := []string{
 		"MERCHANDISE_OUT_OF_STOCK", "DELIVERY_NO_DELIVERY_STRATEGY_AVAILABLE",
 		"PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT", "REQUIRED_ARTIFACTS_UNAVAILABLE",
-		"HTTP_402", "HTTP_403", "HTTP_404", "THROTTLED", "HTTP_ERROR",
+		"HTTP_402", "HTTP_403", "HTTP_404", "HTTP_429", "THROTTLED", "HTTP_ERROR",
 		"DELIVERY_DELIVERY_LINE_DETAIL_CHANGED",
 		"VALIDATION_CUSTOM",
 		"PAYMENTS_METHOD",

@@ -423,17 +423,37 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 		expLines = append(expLines, map[string]string{"signedHandle": exp["signedHandle"]})
 	}
 
-	// Payment amounts: always use {any: true} to accept whatever currency/amount
-	// Shopify expects. Hardcoding USD breaks international stores (MYR, ZAR, etc.)
-	// and causes PAYMENTS_UNACCEPTABLE_PAYMENT_AMOUNT on every non-USD site.
+	// Build delivery block with expectations INSIDE it (per Shopify spec)
+	deliveryBlock := map[string]any{
+		"deliveryLines":      []any{deliveryLine},
+		"noDeliveryRequired": []any{},
+	}
+	if len(expLines) > 0 {
+		deliveryBlock["deliveryExpectationLines"] = expLines
+	}
+
+	// Payment amounts: use actual total+currency from proposal when available,
+	// fall back to {any: true} when total is missing
+	currency := cs.CurrencyCode
+	if currency == "" {
+		currency = "USD"
+	}
 	paymentTotalAmount := map[string]any{"any": true}
 	paymentLineAmount := map[string]any{"any": true}
+	if cs.ActualTotal != "" {
+		totalF := parsePrice(cs.ActualTotal)
+		if totalF > 0 {
+			amountVal := map[string]any{"amount": totalF, "currencyCode": currency}
+			paymentTotalAmount = map[string]any{"value": amountVal}
+			paymentLineAmount = map[string]any{"value": amountVal}
+		}
+	}
 
 	inputData := map[string]any{
 		"sessionInput": map[string]any{"sessionToken": cs.SessionToken},
 		"queueToken":   cs.QueueToken,
 		"discounts":    map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
-		"delivery":     map[string]any{"deliveryLines": []any{deliveryLine}, "noDeliveryRequired": []any{}},
+		"delivery":     deliveryBlock,
 		"merchandise":  cs.merchandiseBlock(),
 		"payment": map[string]any{
 			"totalAmount": paymentTotalAmount,
@@ -441,8 +461,9 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 				map[string]any{
 					"paymentMethod": map[string]any{
 						"directPaymentMethod": map[string]any{
-							"sessionId":      cs.CardSessionID,
-							"billingAddress": map[string]any{"streetAddress": billingAddr},
+							"paymentMethodIdentifier": "bfe4013b52b37df95b64c063a41da319",
+							"sessionId":               cs.CardSessionID,
+							"billingAddress":          map[string]any{"streetAddress": billingAddr},
 						},
 					},
 					"amount": paymentLineAmount,
@@ -450,14 +471,8 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 			},
 			"billingAddress": map[string]any{"streetAddress": billingAddr},
 		},
-		"buyerIdentity": cs.buyerIdentity(),
+		"buyerIdentity": cs.buyerIdentitySubmit(),
 		"taxes":         map[string]any{"proposedTotalAmount": map[string]any{"any": true}},
-	}
-
-	if len(expLines) > 0 {
-		inputData["deliveryExpectations"] = map[string]any{
-			"deliveryExpectationLines": expLines,
-		}
 	}
 
 	payload := addAPQExtensions(map[string]any{
@@ -738,10 +753,34 @@ func (cs *CheckoutSession) merchandiseBlock() map[string]any {
 }
 
 func (cs *CheckoutSession) buyerIdentity() map[string]any {
+	currency := "USD"
+	if cs.CurrencyCode != "" {
+		currency = cs.CurrencyCode
+	}
 	return map[string]any{
-		"customer": map[string]any{"presentmentCurrency": "USD", "countryCode": cs.Addr.Country},
+		"customer": map[string]any{"presentmentCurrency": currency, "countryCode": cs.Addr.Country},
 		"email":    cs.Addr.Email,
 	}
+}
+
+// buyerIdentitySubmit returns buyer identity with phone fields for Step 4 (SubmitForCompletion)
+func (cs *CheckoutSession) buyerIdentitySubmit() map[string]any {
+	currency := "USD"
+	if cs.CurrencyCode != "" {
+		currency = cs.CurrencyCode
+	}
+	bi := map[string]any{
+		"customer": map[string]any{"presentmentCurrency": currency, "countryCode": cs.Addr.Country},
+		"email":    cs.Addr.Email,
+	}
+	if cs.Addr.Phone != "" {
+		bi["phoneCountryCode"] = cs.Addr.Country
+		bi["shopPayOptInPhone"] = map[string]any{
+			"number":      cs.Addr.Phone,
+			"countryCode": cs.Addr.Country,
+		}
+	}
+	return bi
 }
 
 func (cs *CheckoutSession) billingAddress() map[string]any {
@@ -923,10 +962,15 @@ func (cs *CheckoutSession) extractTotal(sellerProposal map[string]any) {
 	for _, key := range []string{"runningTotal", "checkoutTotal"} {
 		ct := getMap(sellerProposal, key)
 		if getString(ct, "__typename") == "MoneyValueConstraint" {
-			amt := getString(getMap(ct, "value"), "amount")
+			v := getMap(ct, "value")
+			amt := getString(v, "amount")
+			curr := getString(v, "currencyCode")
 			if amt != "" {
 				cs.ActualTotal = amt
-				fmt.Printf("  [OK] Total: $%s\n", amt)
+				if curr != "" {
+					cs.CurrencyCode = curr
+				}
+				fmt.Printf("  [OK] Total: %s %s\n", amt, cs.CurrencyCode)
 				return
 			}
 		}

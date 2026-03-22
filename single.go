@@ -352,9 +352,9 @@ func processSingleMultiSite(cardLine string, sites []string, proxyStr string, pr
 		product   *Product
 	}
 
-	maxCheckoutSlots := 6
+	maxCheckoutSlots := 15
 	probeCh := make(chan probeResult, len(shuffled))
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
 
 	var deadMu sync.Mutex
 	var allPermDeadSites []string
@@ -387,6 +387,7 @@ func processSingleMultiSite(cardLine string, sites []string, proxyStr string, pr
 				// Skip cached products over the price limit
 				if cfg.MaxPrice > 0 && p.Price > cfg.MaxPrice {
 					fmt.Fprintf(os.Stderr, "[P1] [%s] Cached product $%s exceeds $%.0f limit — skipping\n", siteLabel, p.PriceStr, cfg.MaxPrice)
+					probeCh <- probeResult{shopURL: shopURL, siteLabel: siteLabel}
 					return
 				}
 				fmt.Fprintf(os.Stderr, "[P1] [%s] Cached product: %s\n", siteLabel, p.Title)
@@ -401,7 +402,7 @@ func processSingleMultiSite(cardLine string, sites []string, proxyStr string, pr
 				probeProxy = proxyPool[probeIdx%len(proxyPool)]
 			}
 			fp := randomFingerprint()
-			client := newClient(fp, probeProxy, 5*time.Second)
+			client := newClient(fp, probeProxy, 8*time.Second)
 			p := autoDetectProduct(client, shopURL, fp)
 
 			if p != nil {
@@ -487,10 +488,66 @@ startPhase2:
 		len(viable), probesReceived, phase1Time)
 
 	if len(viable) == 0 {
+		// ══ Phase 1b — Desperate fallback: retry with NO price limit ══
+		// Instead of immediately returning ALL_SITES_EXHAUSTED, try a
+		// synchronous probe of up to 10 random sites with relaxed MaxPrice.
+		// This catches stores where cheapest product > MaxPrice.
+		fallbackCount := min(10, len(shuffled))
+		fmt.Fprintf(os.Stderr, "[SINGLE] Phase 1b: 0 viable → retrying %d sites with MaxPrice=$%.0f\n", fallbackCount, cfg.MaxPriceFallback)
+
+		origMaxPrice := cfg.MaxPrice
+		cfg.MaxPrice = cfg.MaxPriceFallback
+
+		for i := 0; i < fallbackCount; i++ {
+			siteURL := shuffled[i]
+			shopURL := normalizeShopURL(siteURL)
+			siteLabel := formatSiteLabel(shopURL)
+
+			// Check product cache with relaxed price
+			if cached, ok := productCacheIn[shopURL]; ok && cached.VariantID != "" {
+				p := &Product{
+					ID: cached.ProductID, VariantID: cached.VariantID,
+					PriceStr: cached.Price, Title: cached.Title,
+				}
+				p.Price = parsePrice(p.PriceStr)
+				if cfg.MaxPrice <= 0 || p.Price <= cfg.MaxPrice {
+					fmt.Fprintf(os.Stderr, "[P1b] [%s] Cached product (relaxed): %s $%s\n", siteLabel, p.Title, p.PriceStr)
+					viable = append(viable, viableSite{shopURL, siteLabel, p})
+					allDiscovered[shopURL] = CachedProduct{VariantID: p.VariantID, ProductID: p.ID, Price: p.PriceStr, Title: p.Title}
+					if len(viable) >= 5 {
+						break
+					}
+					continue
+				}
+			}
+
+			// HTTP probe with relaxed price
+			probeProxy := proxyURL
+			if len(proxyPool) > 0 {
+				probeProxy = proxyPool[i%len(proxyPool)]
+			}
+			fp := randomFingerprint()
+			client := newClient(fp, probeProxy, 8*time.Second)
+			p := autoDetectProduct(client, shopURL, fp)
+			if p != nil {
+				fmt.Fprintf(os.Stderr, "[P1b] [%s] Found (relaxed): %s $%s\n", siteLabel, p.Title, p.PriceStr)
+				viable = append(viable, viableSite{shopURL, siteLabel, p})
+				allDiscovered[shopURL] = CachedProduct{VariantID: p.VariantID, ProductID: p.ID, Price: p.PriceStr, Title: p.Title}
+				if len(viable) >= 5 {
+					break
+				}
+			}
+		}
+
+		cfg.MaxPrice = origMaxPrice
+		fmt.Fprintf(os.Stderr, "[SINGLE] Phase 1b done: %d viable found\n", len(viable))
+	}
+
+	if len(viable) == 0 {
 		return SingleResponse{
 			Status:             "error",
 			Code:               "ALL_SITES_EXHAUSTED",
-			Error:              fmt.Sprintf("probed %d sites, none had products (%.1fs)", len(shuffled), phase1Time),
+			Error:              fmt.Sprintf("probed %d sites (incl fallback), none had products (%.1fs)", len(shuffled), elapsed(start)),
 			ErrorType:          "unknown",
 			Elapsed:            elapsed(start),
 			DeadSites:          dedup(allPermDeadSites),
@@ -511,12 +568,12 @@ startPhase2:
 	//  result (Step 4/5) wins and cancels everything.
 	// ══════════════════════════════════════════════════════════════════
 
-	maxViable := 20
+	maxViable := 30
 	if len(viable) > maxViable {
 		viable = viable[:maxViable]
 	}
 
-	numWorkers := min(6, len(viable))
+	numWorkers := min(8, len(viable))
 	fmt.Fprintf(os.Stderr, "[SINGLE] Phase 2: %d workers, %d sites queued\n",
 		numWorkers, len(viable))
 
@@ -535,7 +592,7 @@ startPhase2:
 	}
 
 	checkoutCh := make(chan checkoutOutcome, len(viable))
-	checkoutCtx, checkoutCancel := context.WithTimeout(context.Background(), 35*time.Second)
+	checkoutCtx, checkoutCancel := context.WithTimeout(context.Background(), 55*time.Second)
 	defer checkoutCancel()
 
 	var wg sync.WaitGroup
@@ -574,7 +631,7 @@ startPhase2:
 						siteLabel, product.PriceStr)
 
 					fp := randomFingerprint()
-					client := newClient(fp, currentProxy, 8*time.Second)
+					client := newClient(fp, currentProxy, 12*time.Second)
 
 					cs := &CheckoutSession{
 						Client:    client,

@@ -75,6 +75,7 @@ type CheckoutSession struct {
 	ShippingHandle string
 	ShippingAmount string
 	ActualTotal    string
+	CurrencyCode   string
 	DeliveryExps   []map[string]string // [{signedHandle: "..."}]
 	PhoneRequired  bool
 	CardSessionID  string

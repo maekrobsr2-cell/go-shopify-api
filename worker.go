@@ -263,6 +263,7 @@ func processCard(idx int, card Card, sites []string, proxies *ProxyRotator, addr
 			// Build checkout session
 			cs := &CheckoutSession{
 				Client:    client,
+				ProxyURL:  proxyURL,
 				ShopURL:   shopURL,
 				VariantID: product.VariantID,
 				Card:      card,

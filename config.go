@@ -14,6 +14,7 @@ var cfg = struct {
 	ShortSleep         time.Duration
 	MaxWaitSeconds     float64
 	MaxPrice           float64
+	MaxPriceFallback   float64
 	FastMode           bool
 	SummaryOnly        bool
 	HardcodedPhone     string
@@ -28,7 +29,8 @@ var cfg = struct {
 	PollReceiptMax:     10,
 	ShortSleep:         400 * time.Millisecond,
 	MaxWaitSeconds:     1.5,
-	MaxPrice:           15.0,
+	MaxPrice:           50.0,
+	MaxPriceFallback:   500.0,
 	FastMode:           true,
 	SummaryOnly:        true,
 	HardcodedPhone:     "2494851515",

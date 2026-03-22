@@ -657,6 +657,9 @@ startPhase2:
 						}
 					}
 
+					// ── Session warming: build realistic cookie profile ──
+					cs.WarmStorefrontSession()
+
 					// ── Step 1: Add to cart + create checkout ──
 					if err := cs.Step1AddToCart(); err != nil {
 						errStr := err.Error()

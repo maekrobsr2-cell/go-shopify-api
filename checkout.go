@@ -498,7 +498,7 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 		"queueToken":   cs.QueueToken,
 		"discounts":    map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
 		"delivery":     deliveryBlock,
-		"merchandise":  cs.merchandiseBlock(),
+		"merchandise":  cs.merchandiseBlock(false),
 		"payment": map[string]any{
 			"totalAmount": paymentTotalAmount,
 			"paymentLines": []any{
@@ -718,27 +718,34 @@ func (cs *CheckoutSession) buildProposalPayload(query string, shippingHandle str
 		deliveryBlock["supportsSplitShipping"] = true
 	}
 
+	// Core 7 variables (sent for BOTH initial Step 3 AND polls)
+	vars := map[string]any{
+		"delivery":      deliveryBlock,
+		"discounts":     map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
+		"payment":       map[string]any{"totalAmount": map[string]any{"any": true}, "paymentLines": []any{}, "billingAddress": map[string]any{"streetAddress": cs.billingAddress()}},
+		"merchandise":   cs.merchandiseBlock(forPoll),
+		"buyerIdentity": cs.buyerIdentity(),
+		"taxes":         map[string]any{"proposedTotalAmount": map[string]any{"any": true}},
+		"sessionInput":  map[string]any{"sessionToken": cs.SessionToken},
+	}
+
+	// Extra 6 variables ONLY for polls (matches Python: step3_proposal_ctx sends 7, polls send 13)
+	if forPoll {
+		vars["tip"] = map[string]any{"tipLines": []any{}}
+		vars["note"] = map[string]any{"message": nil, "customAttributes": []any{}}
+		vars["scriptFingerprint"] = map[string]any{
+			"signature": nil, "signatureUuid": nil,
+			"lineItemScriptChanges": []any{}, "paymentScriptChanges": []any{}, "shippingScriptChanges": []any{},
+		}
+		vars["optionalDuties"] = map[string]any{"buyerRefusesDuties": false}
+		vars["cartMetafields"] = []any{}
+		vars["memberships"] = map[string]any{"memberships": []any{}}
+	}
+
 	return map[string]any{
 		"operationName": "Proposal",
 		"query":         query,
-		"variables": map[string]any{
-			"delivery":      deliveryBlock,
-			"discounts":     map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
-			"payment":       map[string]any{"totalAmount": map[string]any{"any": true}, "paymentLines": []any{}, "billingAddress": map[string]any{"streetAddress": cs.billingAddress()}},
-			"merchandise":   cs.merchandiseBlock(),
-			"buyerIdentity": cs.buyerIdentity(),
-			"taxes":         map[string]any{"proposedTotalAmount": map[string]any{"any": true}},
-			"sessionInput":  map[string]any{"sessionToken": cs.SessionToken},
-			"tip":           map[string]any{"tipLines": []any{}},
-			"note":          map[string]any{"message": nil, "customAttributes": []any{}},
-			"scriptFingerprint": map[string]any{
-				"signature": nil, "signatureUuid": nil,
-				"lineItemScriptChanges": []any{}, "paymentScriptChanges": []any{}, "shippingScriptChanges": []any{},
-			},
-			"optionalDuties": map[string]any{"buyerRefusesDuties": false},
-			"cartMetafields": []any{},
-			"memberships":    map[string]any{"memberships": []any{}},
-		},
+		"variables":     vars,
 	}
 }
 
@@ -795,24 +802,30 @@ func (cs *CheckoutSession) buildDeliveryLine(handle string, stableID string, use
 	return line
 }
 
-func (cs *CheckoutSession) merchandiseBlock() map[string]any {
+func (cs *CheckoutSession) merchandiseBlock(forPoll bool) map[string]any {
+	pvRef := map[string]any{
+		"id":         fmt.Sprintf("gid://shopify/ProductVariantMerchandise/%s", cs.VariantID),
+		"variantId":  fmt.Sprintf("gid://shopify/ProductVariant/%s", cs.VariantID),
+		"properties": []any{},
+	}
+	// Only polls include sellingPlanId (matches Python poll_for_delivery_and_expectations_ctx)
+	if forPoll {
+		pvRef["sellingPlanId"] = nil
+	}
+
+	lineItem := map[string]any{
+		"stableId":           cs.MerchandiseID,
+		"merchandise":        map[string]any{"productVariantReference": pvRef},
+		"quantity":           map[string]any{"items": map[string]any{"value": 1}},
+		"expectedTotalPrice": map[string]any{"any": true},
+	}
+	// Only polls include lineComponents (matches Python poll_for_delivery_and_expectations_ctx)
+	if forPoll {
+		lineItem["lineComponents"] = []any{}
+	}
+
 	return map[string]any{
-		"merchandiseLines": []any{
-			map[string]any{
-				"stableId": cs.MerchandiseID,
-				"merchandise": map[string]any{
-					"productVariantReference": map[string]any{
-						"id":            fmt.Sprintf("gid://shopify/ProductVariantMerchandise/%s", cs.VariantID),
-						"variantId":     fmt.Sprintf("gid://shopify/ProductVariant/%s", cs.VariantID),
-						"properties":    []any{},
-						"sellingPlanId": nil,
-					},
-				},
-				"quantity":           map[string]any{"items": map[string]any{"value": 1}},
-				"expectedTotalPrice": map[string]any{"any": true},
-				"lineComponents":     []any{},
-			},
-		},
+		"merchandiseLines": []any{lineItem},
 	}
 }
 

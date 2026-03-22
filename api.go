@@ -104,13 +104,22 @@ func handleCheckSingle(w http.ResponseWriter, r *http.Request) {
 		req.ProductCache = make(map[string]CachedProduct)
 	}
 
+	// Default to addresses.txt if no addresses file specified (API callers
+	// like STALIN dashboard don't know the server's file path)
+	addrFile := req.AddressesFile
+	if addrFile == "" {
+		if _, err := os.Stat("addresses.txt"); err == nil {
+			addrFile = "addresses.txt"
+		}
+	}
+
 	// Process the card using the existing engine
 	result := processSingleMultiSite(
 		req.Card,
 		req.Sites,
 		proxyStr,
 		req.Proxies,
-		req.AddressesFile,
+		addrFile,
 		req.ProductCache,
 		req.TestSitesBlacklist,
 	)
@@ -173,6 +182,14 @@ func handleCheckBatch(w http.ResponseWriter, r *http.Request) {
 		req.ProductCache = make(map[string]CachedProduct)
 	}
 
+	// Default to addresses.txt if no addresses file specified
+	batchAddrFile := req.AddressesFile
+	if batchAddrFile == "" {
+		if _, err := os.Stat("addresses.txt"); err == nil {
+			batchAddrFile = "addresses.txt"
+		}
+	}
+
 	start := time.Now()
 
 	// Process cards in parallel with worker pool
@@ -203,7 +220,7 @@ func handleCheckBatch(w http.ResponseWriter, r *http.Request) {
 				req.Sites,
 				proxyStr,
 				req.Proxies,
-				req.AddressesFile,
+				batchAddrFile,
 				req.ProductCache,
 				req.TestSitesBlacklist,
 			)

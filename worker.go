@@ -194,6 +194,12 @@ func removeSiteFromFile(site string) {
 // ─── Single card processor ───────────────────────────────────────────────────
 
 func processCard(idx int, card Card, sites []string, proxies *ProxyRotator, addresses []Address, productCache *ProductCache) bool {
+	// Reject known test/bogus card numbers immediately
+	if card.IsTestCard() {
+		fmt.Printf("[TEST-CARD] %s is a known test PAN — skipping\n", card.Masked())
+		return false
+	}
+
 	time.Sleep(jitter(cfg.StaggerMinMS, cfg.StaggerMaxMS))
 
 	tried := make(map[string]bool)

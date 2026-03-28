@@ -17,6 +17,72 @@ type Card struct {
 	Name   string `json:"name"`
 }
 
+// Known test/bogus card PANs used by Stripe, Shopify, and other gateways.
+// If a user submits one of these, we immediately decline — no checkout attempt.
+var testCardPANs = map[string]bool{
+	// Visa test cards
+	"4242424242424242": true,
+	"4000056655665556": true,
+	"4000002500003155": true,
+	"4000003800000446": true,
+	"4000002760003184": true,
+	"4000000000009995": true,
+	"4000000000009987": true,
+	"4000000000009979": true,
+	"4000000000000069": true,
+	"4000000000000127": true,
+	"4000000000000002": true,
+	"4000000000003220": true,
+	"4000000000003063": true,
+	"4000000000000341": true,
+	"4000003560000123": true,
+	"4000000000000077": true,
+	"4000000000000093": true,
+	"4000000000000119": true,
+	"4000000000000259": true,
+	"4000000000003055": true,
+	"4000000000003097": true,
+	"4000000000003089": true,
+	"4000000000003071": true,
+	"4000000000000101": true,
+	"4111111111111111": true,
+	"4012888888881881": true,
+	"4222222222222":    true,
+	"4100390489958229": true, // our own dead card
+	// Mastercard test cards
+	"5555555555554444": true,
+	"5200828282828210": true,
+	"5105105105105100": true,
+	"2223003122003222": true,
+	"2223000048400011": true,
+	"5425233430109903": true,
+	"2222420000001113": true,
+	"2223000048410010": true,
+	// Amex test cards
+	"378282246310005":  true,
+	"371449635398431":  true,
+	"340000000000009":  true,
+	"378734493671000":  true,
+	// Discover test cards
+	"6011111111111117": true,
+	"6011000990139424": true,
+	// Diners Club
+	"30569309025904":   true,
+	"38520000023237":   true,
+	// JCB
+	"3530111333300000": true,
+	"3566002020360505": true,
+	// UnionPay
+	"6200000000000005": true,
+	// Shopify bogus gateway
+	"1":                true,
+}
+
+// isTestCard returns true if the card number is a known test/bogus PAN.
+func (c Card) IsTestCard() bool {
+	return testCardPANs[onlyDigits(c.Number)]
+}
+
 func (c Card) Masked() string {
 	d := onlyDigits(c.Number)
 	if len(d) >= 4 {

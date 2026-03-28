@@ -350,6 +350,16 @@ func processSingleMultiSite(cardLine string, sites []string, proxyStr string, pr
 		}
 	}
 
+	// Reject known test/bogus card numbers immediately
+	if card.IsTestCard() {
+		fmt.Fprintf(os.Stderr, "[TEST-CARD] %s is a known test PAN — auto-declining\n", card.Masked())
+		return SingleResponse{
+			Status: "declined", Code: "TEST_CARD_REJECTED",
+			Error: "known test/bogus card number", ErrorType: "card",
+			Elapsed: elapsed(start),
+		}
+	}
+
 	// Proxy pool for rotation (CAPTCHA retry uses different proxy)
 	var proxyPool []string
 	for _, p := range proxies {

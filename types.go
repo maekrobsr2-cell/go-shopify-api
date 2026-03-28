@@ -65,10 +65,11 @@ type CheckoutSession struct {
 	Card      Card
 	Addr      Address
 	FP        Fingerprint
-	BuildID   string // checkout-web build hash
+	BuildID   string // checkout-web build hash (commitSha)
 
 	// populated during flow
 	CheckoutToken  string
+	CheckoutURL    string // full checkout URL after redirect
 	SessionToken   string
 	MerchandiseID  string
 	QueueToken     string
@@ -79,6 +80,16 @@ type CheckoutSession struct {
 	DeliveryExps   []map[string]string // [{signedHandle: "..."}]
 	PhoneRequired  bool
 	CardSessionID  string
+
+	// V2 fields — populated from checkout HTML + JS
+	StableID                string // merchandise stable ID from HTML
+	SourceToken             string // serialized-sourceToken from HTML meta
+	IdentificationSignature string // PCI caller identification signature
+	ProposalID              string // persisted query ID from actions JS
+	SubmitID                string // persisted query ID from actions JS
+	PollForReceiptID        string // persisted query ID from processing JS
+	ReceiptSessionToken     string // separate session token from submit response for polling
+	DetectedCountry         string // country detected from first proposal
 }
 
 // ─── Result of a single card attempt ─────────────────────────────────────────

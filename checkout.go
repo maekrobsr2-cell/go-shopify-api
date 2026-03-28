@@ -6,21 +6,21 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/google/uuid"
 )
 
-// decompressBody wraps resp.Body with the appropriate decompressor
-// based on the Content-Encoding header. Must be called before reading
-// the body whenever we explicitly set Accept-Encoding in the request.
+// ─── Decompression helper ────────────────────────────────────────────────────
+
 func decompressBody(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
 		return
@@ -38,39 +38,7 @@ func decompressBody(resp *http.Response) {
 	}
 }
 
-// ─── GraphQL header builder ──────────────────────────────────────────────────
-
-func (cs *CheckoutSession) graphqlHeaders() http.Header {
-	parsed, _ := url.Parse(cs.ShopURL)
-	origin := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
-
-	h := http.Header{}
-	h.Set("Accept", "application/json")
-	h.Set("Accept-Language", "en-US,en;q=0.9")
-	h.Set("Accept-Encoding", "gzip, deflate, br")
-	h.Set("Content-Type", "application/json")
-	h.Set("Origin", origin)
-	h.Set("Referer", fmt.Sprintf("%s/checkouts/cn/%s", origin, cs.CheckoutToken))
-	h.Set("Sec-CH-UA", cs.FP.SecCHUA)
-	h.Set("Sec-CH-UA-Mobile", cs.FP.SecCHUAMobile)
-	h.Set("Sec-CH-UA-Platform", cs.FP.SecCHUAPlatform)
-	h.Set("Sec-Fetch-Dest", "empty")
-	h.Set("Sec-Fetch-Mode", "cors")
-	h.Set("Sec-Fetch-Site", "same-origin")
-	h.Set("User-Agent", cs.FP.UserAgent)
-	h.Set("shopify-checkout-client", "checkout-web/1.0")
-	h.Set("shopify-checkout-source", fmt.Sprintf(`id="%s", type="cn"`, cs.CheckoutToken))
-	h.Set("x-checkout-web-source-id", cs.CheckoutToken)
-	h.Set("x-checkout-one-session-token", cs.SessionToken)
-	if cs.BuildID != "" {
-		h.Set("x-checkout-web-build-id", cs.BuildID)
-	}
-	return h
-}
-
 // ─── Test / Bogus Gateway Detection ─────────────────────────────────────────
-// Matches neww.py's _TEST_MODE_PATTERNS: scan checkout HTML for Shopify
-// test-mode / bogus-gateway indicators. Only scan first 50 KB.
 
 var testModePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)bogus\s*gateway`),
@@ -85,11 +53,11 @@ var testModePatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)"provider"\s*:\s*"bogus"`),
 }
 
-func detectTestMode(html string) bool {
-	if len(html) == 0 {
+func detectTestMode(body string) bool {
+	if len(body) == 0 {
 		return false
 	}
-	sample := html
+	sample := body
 	if len(sample) > 50000 {
 		sample = sample[:50000]
 	}
@@ -101,14 +69,260 @@ func detectTestMode(html string) bool {
 	return false
 }
 
-// ─── Session warming: visit storefront before checkout ──────────────────────
-// Matches Python's warm_storefront_session(): visits homepage, /collections,
-// and /cart.js to build a realistic cookie/session profile. Without this,
-// Shopify is more likely to trigger CAPTCHAs or reject the checkout.
+// ─── HTML Extraction Helpers (V2 — from newworking_main.go) ─────────────────
+
+func extractStableID(checkoutHTML string) string {
+	unescaped := html.UnescapeString(checkoutHTML)
+	re := regexp.MustCompile(`"stableId"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"`)
+	m := re.FindStringSubmatch(unescaped)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractCommitSha(checkoutHTML string) string {
+	unescaped := html.UnescapeString(checkoutHTML)
+	re := regexp.MustCompile(`"commitSha"\s*:\s*"([a-f0-9]{40})"`)
+	m := re.FindStringSubmatch(unescaped)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractSourceToken(checkoutHTML string) string {
+	re := regexp.MustCompile(`<meta\s+name="serialized-sourceToken"\s+content="([^"]*)"`)
+	m := re.FindStringSubmatch(checkoutHTML)
+	if len(m) < 2 {
+		return ""
+	}
+	val := html.UnescapeString(m[1])
+	return strings.Trim(val, `"`)
+}
+
+func extractIdentificationSignature(checkoutHTML string) string {
+	unescaped := html.UnescapeString(checkoutHTML)
+	re := regexp.MustCompile(`checkoutCardsinkCallerIdentificationSignature":"([^"]+)"`)
+	m := re.FindStringSubmatch(unescaped)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractPrivateAccessTokenID(checkoutHTML string) string {
+	unescaped := html.UnescapeString(checkoutHTML)
+	re := regexp.MustCompile(`"checkoutSessionIdentifier"\s*:\s*"([a-f0-9]+)"`)
+	m := re.FindStringSubmatch(unescaped)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractActionsJSURL(checkoutHTML, shopURL string) string {
+	re := regexp.MustCompile(`(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)`)
+	m := re.FindStringSubmatch(checkoutHTML)
+	if len(m) < 2 {
+		return ""
+	}
+	return shopURL + m[1]
+}
+
+func extractProcessingJSURL(checkoutHTML, shopURL string) string {
+	re := regexp.MustCompile(`(/cdn/shopifycloud/checkout-web/assets/c1/useHasOrdersFromMultipleShops[A-Za-z0-9_.-]*\.js)`)
+	m := re.FindStringSubmatch(checkoutHTML)
+	if len(m) < 2 {
+		return ""
+	}
+	return shopURL + m[1]
+}
+
+func extractProposalID(jsBody string) string {
+	re := regexp.MustCompile(`id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"`)
+	m := re.FindStringSubmatch(jsBody)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractSubmitForCompletionID(jsBody string) string {
+	re := regexp.MustCompile(`id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"`)
+	m := re.FindStringSubmatch(jsBody)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractPollForReceiptID(jsBody string) string {
+	re := regexp.MustCompile(`id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"PollForReceipt"`)
+	m := re.FindStringSubmatch(jsBody)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// ─── Proposal Response Extraction Helpers ────────────────────────────────────
+
+func extractQueueTokenStr(body string) string {
+	re := regexp.MustCompile(`"queueToken"\s*:\s*"([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractDeliveryHandleStr(body string) string {
+	re := regexp.MustCompile(`"handle"\s*:\s*"([^"]+)"\s*,\s*"phoneRequired"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	re2 := regexp.MustCompile(`"handle"\s*:\s*"([^"]+?)"\s*,\s*"[^"]*"\s*:\s*(?:true|false)\s*,\s*"amount"`)
+	m = re2.FindStringSubmatch(body)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
+
+func extractSignedHandlesStr(body string) []string {
+	re := regexp.MustCompile(`"signedHandle"\s*:\s*"([^"]+)"`)
+	matches := re.FindAllStringSubmatch(body, -1)
+	var handles []string
+	for _, m := range matches {
+		if len(m) >= 2 {
+			handles = append(handles, m[1])
+		}
+	}
+	return handles
+}
+
+func extractShippingAmountStr(body string) string {
+	re := regexp.MustCompile(`"deliveryStrategyBreakdown"\s*:\s*\[\s*\{\s*"amount"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractCheckoutTotalStr(body string) string {
+	re := regexp.MustCompile(`"checkoutTotal"\s*:\s*\{[^}]*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractSellerTotalStr(body string) string {
+	re := regexp.MustCompile(`"total"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractSellerCurrencyStr(body string) string {
+	re := regexp.MustCompile(`"supportedCurrencies"\s*:\s*\["([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractSellerCountryStr(body string) string {
+	re := regexp.MustCompile(`"supportedCountries"\s*:\s*\["([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+func extractSellerMerchandisePriceStr(body string) string {
+	re := regexp.MustCompile(`"ContextualizedProductVariantMerchandise".*?"totalAmount"\s*:\s*\{\s*"value"\s*:\s*\{\s*"amount"\s*:\s*"([^"]+)"`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return m[1]
+}
+
+// ─── Token / ID Generation ──────────────────────────────────────────────────
+
+func generateAttemptToken(checkoutToken string) string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 10)
+	for i := range b {
+		b[i] = chars[rand.IntN(len(chars))]
+	}
+	return checkoutToken + "-" + string(b)
+}
+
+func generatePageID() string {
+	b := make([]byte, 16)
+	for i := range b {
+		b[i] = byte(rand.IntN(256))
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// ─── GraphQL Headers Builder (V2 — matches newworking_main.go) ──────────────
+
+func (cs *CheckoutSession) graphqlHeaders() http.Header {
+	h := http.Header{}
+	h.Set("Accept", "application/json")
+	h.Set("Accept-Language", "en-US")
+	h.Set("Content-Type", "application/json")
+	h.Set("Origin", cs.ShopURL)
+	h.Set("Priority", "u=1, i")
+	if cs.CheckoutURL != "" {
+		h.Set("Referer", cs.CheckoutURL)
+	}
+	h.Set("Sec-CH-UA", cs.FP.SecCHUA)
+	h.Set("Sec-CH-UA-Mobile", cs.FP.SecCHUAMobile)
+	h.Set("Sec-CH-UA-Platform", cs.FP.SecCHUAPlatform)
+	h.Set("Sec-Fetch-Dest", "empty")
+	h.Set("Sec-Fetch-Mode", "cors")
+	h.Set("Sec-Fetch-Site", "same-origin")
+	h.Set("User-Agent", cs.FP.UserAgent)
+	h.Set("shopify-checkout-client", "checkout-web/1.0")
+	h.Set("shopify-checkout-source", fmt.Sprintf(`id="%s", type="cn"`, cs.CheckoutToken))
+	h.Set("x-checkout-one-session-token", cs.SessionToken)
+	if cs.BuildID != "" {
+		h.Set("x-checkout-web-build-id", cs.BuildID)
+	}
+	h.Set("x-checkout-web-deploy-stage", "production")
+	h.Set("x-checkout-web-server-handling", "fast")
+	h.Set("x-checkout-web-server-rendering", "yes")
+	if cs.SourceToken != "" {
+		h.Set("x-checkout-web-source-id", cs.SourceToken)
+	}
+	return h
+}
+
+// graphqlHeadersPoll is like graphqlHeaders but uses CheckoutToken for source-id (matches new file polling)
+func (cs *CheckoutSession) graphqlHeadersPoll() http.Header {
+	h := cs.graphqlHeaders()
+	h.Set("x-checkout-web-source-id", cs.CheckoutToken)
+	return h
+}
+
+// ─── Session warming ─────────────────────────────────────────────────────────
+// V2: Minimal — cart add + GET /checkout establishes session.
 
 func (cs *CheckoutSession) WarmStorefrontSession() {
-	// Step 1: Visit homepage (sets _shopify_y, _shopify_s cookies)
-	fmt.Println("  [WARM] Visiting storefront...")
 	req, err := http.NewRequest("GET", cs.ShopURL, nil)
 	if err == nil {
 		setBrowseHeaders(req, cs.FP, cs.ShopURL)
@@ -117,56 +331,22 @@ func (cs *CheckoutSession) WarmStorefrontSession() {
 			resp.Body.Close()
 		}
 	}
-
-	time.Sleep(jitter(300, 700))
-
-	// Step 2: Visit collections page (builds referrer chain)
-	parsed, _ := url.Parse(cs.ShopURL)
-	origin := fmt.Sprintf("%s://%s", parsed.Scheme, parsed.Host)
-	req, err = http.NewRequest("GET", cs.ShopURL+"/collections", nil)
-	if err == nil {
-		setBrowseHeaders(req, cs.FP, cs.ShopURL)
-		req.Header.Set("Referer", origin+"/")
-		req.Header.Set("Sec-Fetch-Site", "same-origin")
-		resp, err := cs.Client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-	}
-
 	time.Sleep(jitter(200, 500))
-
-	// Step 3: Hit cart.js to initialize cart cookie
-	req, err = http.NewRequest("GET", cs.ShopURL+"/cart.js", nil)
-	if err == nil {
-		setBrowseHeaders(req, cs.FP, cs.ShopURL)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Sec-Fetch-Dest", "empty")
-		req.Header.Set("Sec-Fetch-Mode", "cors")
-		req.Header.Set("X-Requested-With", "XMLHttpRequest")
-		resp, err := cs.Client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-	}
 }
 
-// ─── Step 1: Add to cart & create checkout ───────────────────────────────────
+// ─── Step 1: Add to Cart + Checkout + Extract All IDs + Private Token + JS IDs ─
 
 func (cs *CheckoutSession) Step1AddToCart() error {
-	fmt.Println("[1/5] Adding to cart and creating checkout...")
+	fmt.Println("[1/5] Cart + checkout + extracting IDs...")
 
-	// Add to cart
-	payload, _ := json.Marshal(map[string]any{
-		"id":       cs.VariantID,
-		"quantity": 1,
-	})
+	// ── Add to cart ──
+	payload := fmt.Sprintf(`{"id":%s,"quantity":1}`, cs.VariantID)
 
-	time.Sleep(jitter(150, 400))
+	time.Sleep(jitter(100, 300))
 
-	req, err := http.NewRequest("POST", cs.ShopURL+"/cart/add.js", bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", cs.ShopURL+"/cart/add.js", strings.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("cart/add.js request build: %w", err)
+		return fmt.Errorf("cart/add.js build: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -178,19 +358,20 @@ func (cs *CheckoutSession) Step1AddToCart() error {
 	if err != nil {
 		return fmt.Errorf("cart/add.js: %w", err)
 	}
+	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
 	if resp.StatusCode == 429 {
 		return fmt.Errorf("429 rate limited on cart/add")
 	}
-	fmt.Printf("  Add to cart: %d\n", resp.StatusCode)
+	fmt.Printf("  Cart add: %d\n", resp.StatusCode)
 
-	time.Sleep(jitter(300, 600))
+	time.Sleep(jitter(200, 500))
 
-	// Get checkout
+	// ── GET /checkout (follows redirects) ──
 	checkoutReq, err := http.NewRequest("GET", cs.ShopURL+"/checkout", nil)
 	if err != nil {
-		return fmt.Errorf("checkout request build: %w", err)
+		return fmt.Errorf("checkout build: %w", err)
 	}
 	setBrowseHeaders(checkoutReq, cs.FP, cs.ShopURL)
 
@@ -202,53 +383,152 @@ func (cs *CheckoutSession) Step1AddToCart() error {
 	defer checkoutResp.Body.Close()
 
 	bodyBytes, _ := io.ReadAll(checkoutResp.Body)
-	html := string(bodyBytes)
+	checkoutHTML := string(bodyBytes)
 	finalURL := checkoutResp.Request.URL.String()
 
-	// ── Test/bogus gateway detection (Layer 2) ──
-	if detectTestMode(html) {
-		fmt.Printf("  [TEST-DETECT] ⚠️  Bogus/test gateway detected in checkout HTML!\n")
+	// ── Test/bogus gateway detection ──
+	if detectTestMode(checkoutHTML) {
 		return fmt.Errorf("TEST_MODE_DETECTED")
 	}
 
-	fmt.Printf("  [DEBUG] Final URL: %s\n", finalURL)
-
-	if !strings.Contains(finalURL, "/checkouts/cn/") {
+	// ── Extract checkout token from URL ──
+	tokenRe := regexp.MustCompile(`/checkouts/cn/([^/?]+)`)
+	if m := tokenRe.FindStringSubmatch(finalURL); len(m) > 1 {
+		cs.CheckoutToken = m[1]
+	}
+	if cs.CheckoutToken == "" {
 		return fmt.Errorf("no checkout token in URL: %s", finalURL)
 	}
+	cs.CheckoutURL = finalURL
+	fmt.Printf("  Token: %s\n", cs.CheckoutToken)
 
-	// Extract checkout token
-	parts := strings.SplitAfter(finalURL, "/checkouts/cn/")
-	if len(parts) < 2 {
-		return fmt.Errorf("failed to parse checkout token from URL")
-	}
-	token := strings.Split(parts[1], "/")[0]
-	token = strings.Split(token, "?")[0]
-	cs.CheckoutToken = token
-	fmt.Printf("  [OK] Checkout token: %s\n", token)
-
-	// Extract session token
-	cs.SessionToken = extractSessionToken(html)
+	// ── Extract session token ──
+	cs.SessionToken = extractSessionToken(checkoutHTML)
 	if cs.SessionToken == "" {
 		return fmt.Errorf("session token not found in HTML")
 	}
-	fmt.Println("  [OK] Session token extracted")
 
-	// Extract build ID (reduces CAPTCHA triggers)
-	cs.BuildID = extractBuildID(html)
-	if cs.BuildID != "" {
-		fmt.Printf("  [OK] Build ID: %s...\n", truncate(cs.BuildID, 20))
+	// ── Extract stableId, commitSha, sourceToken, identificationSignature ──
+	cs.StableID = extractStableID(checkoutHTML)
+	cs.MerchandiseID = cs.StableID
+	cs.BuildID = extractCommitSha(checkoutHTML)
+	cs.SourceToken = extractSourceToken(checkoutHTML)
+	cs.IdentificationSignature = extractIdentificationSignature(checkoutHTML)
+
+	if cs.BuildID == "" {
+		cs.BuildID = extractBuildID(checkoutHTML)
 	}
+	if cs.StableID == "" {
+		return fmt.Errorf("stableId not found in checkout HTML")
+	}
+	if cs.SourceToken == "" {
+		return fmt.Errorf("sourceToken not found in checkout HTML")
+	}
+	fmt.Printf("  StableID: %s BuildID: %s...\n", truncate(cs.StableID, 12), truncate(cs.BuildID, 12))
+
+	// ── Fetch private access token (sets session cookies) ──
+	patID := extractPrivateAccessTokenID(checkoutHTML)
+	if patID != "" {
+		patURL := fmt.Sprintf("%s/private_access_tokens?id=%s&checkout_type=c1",
+			cs.ShopURL, url.QueryEscape(patID))
+		patReq, err := http.NewRequest("GET", patURL, nil)
+		if err == nil {
+			patReq.Header.Set("Accept", "*/*")
+			patReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+			patReq.Header.Set("Referer", cs.CheckoutURL)
+			patReq.Header.Set("Sec-CH-UA", cs.FP.SecCHUA)
+			patReq.Header.Set("Sec-CH-UA-Mobile", cs.FP.SecCHUAMobile)
+			patReq.Header.Set("Sec-CH-UA-Platform", cs.FP.SecCHUAPlatform)
+			patReq.Header.Set("Sec-Fetch-Dest", "empty")
+			patReq.Header.Set("Sec-Fetch-Mode", "cors")
+			patReq.Header.Set("Sec-Fetch-Site", "same-origin")
+			patReq.Header.Set("User-Agent", cs.FP.UserAgent)
+			patResp, err := cs.Client.Do(patReq)
+			if err == nil {
+				io.Copy(io.Discard, patResp.Body)
+				patResp.Body.Close()
+			}
+		}
+		fmt.Println("  Private access token: done")
+	}
+
+	// ── Extract JS URLs and fetch GraphQL operation IDs ──
+	actionsURL := extractActionsJSURL(checkoutHTML, cs.ShopURL)
+	if actionsURL == "" {
+		return fmt.Errorf("actions JS URL not found")
+	}
+	processingURL := extractProcessingJSURL(checkoutHTML, cs.ShopURL)
+
+	actionsJS, err := cs.fetchJS(actionsURL)
+	if err != nil {
+		return fmt.Errorf("fetch actions JS: %w", err)
+	}
+
+	cs.ProposalID = extractProposalID(actionsJS)
+	cs.SubmitID = extractSubmitForCompletionID(actionsJS)
+	if cs.ProposalID == "" || cs.SubmitID == "" {
+		return fmt.Errorf("proposalID or submitID not found in actions JS")
+	}
+
+	if processingURL != "" {
+		processingJS, err := cs.fetchJS(processingURL)
+		if err == nil {
+			cs.PollForReceiptID = extractPollForReceiptID(processingJS)
+		}
+	}
+	if cs.PollForReceiptID == "" {
+		cs.PollForReceiptID = extractPollForReceiptID(actionsJS)
+	}
+	if cs.PollForReceiptID == "" {
+		return fmt.Errorf("PollForReceipt ID not found in JS")
+	}
+
+	fmt.Printf("  Proposal: %s... Submit: %s... Poll: %s...\n",
+		truncate(cs.ProposalID, 12), truncate(cs.SubmitID, 12), truncate(cs.PollForReceiptID, 12))
 
 	return nil
 }
 
-// ─── Step 2: Tokenize credit card ────────────────────────────────────────────
+// fetchJS fetches a JS file from the given URL
+func (cs *CheckoutSession) fetchJS(jsURL string) (string, error) {
+	req, err := http.NewRequest("GET", jsURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Origin", cs.ShopURL)
+	req.Header.Set("Sec-CH-UA", cs.FP.SecCHUA)
+	req.Header.Set("Sec-CH-UA-Mobile", cs.FP.SecCHUAMobile)
+	req.Header.Set("Sec-CH-UA-Platform", cs.FP.SecCHUAPlatform)
+	req.Header.Set("Sec-Fetch-Dest", "script")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("User-Agent", cs.FP.UserAgent)
+
+	resp, err := cs.Client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	decompressBody(resp)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("JS fetch HTTP %d", resp.StatusCode)
+	}
+	return string(body), nil
+}
+
+// ─── Step 2: Tokenize card via PCI with identification signature ─────────────
 
 func (cs *CheckoutSession) Step2TokenizeCard() error {
-	fmt.Println("[2/5] Tokenizing credit card...")
+	fmt.Println("[2/5] Tokenizing card...")
 
-	time.Sleep(jitter(200, 500))
+	time.Sleep(jitter(100, 300))
 
 	parsed, _ := url.Parse(cs.ShopURL)
 	scopeHost := parsed.Host
@@ -271,43 +551,51 @@ func (cs *CheckoutSession) Step2TokenizeCard() error {
 
 	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("tokenize request build: %w", err)
+		return fmt.Errorf("tokenize build: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Origin", "https://checkout.pci.shopifyinc.com")
-	req.Header.Set("Referer", "https://checkout.pci.shopifyinc.com/")
-	req.Header.Set("Sec-Fetch-Site", "cross-site")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Referer", "https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=")
+	req.Header.Set("Priority", "u=1, i")
 	req.Header.Set("Sec-CH-UA", cs.FP.SecCHUA)
 	req.Header.Set("Sec-CH-UA-Mobile", cs.FP.SecCHUAMobile)
 	req.Header.Set("Sec-CH-UA-Platform", cs.FP.SecCHUAPlatform)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Storage-Access", "active")
 	req.Header.Set("User-Agent", cs.FP.UserAgent)
+	if cs.IdentificationSignature != "" {
+		req.Header.Set("shopify-identification-signature", cs.IdentificationSignature)
+	}
 
-	// Use a standard client WITH proxy for the PCI endpoint (cross-origin, different host)
 	tokenClient := newStandardClient(cs.ProxyURL, cfg.HTTPTimeoutShort)
 
-	// Retry up to 3 times on 429 rate-limit with increasing backoff
 	var resp *http.Response
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
 			backoff := time.Duration(attempt)*time.Second + jitter(500, 1500)
-			fmt.Printf("  [RETRY] Tokenize attempt %d/3 after %v backoff\n", attempt+1, backoff)
+			fmt.Printf("  [RETRY] tokenize attempt %d/3\n", attempt+1)
 			time.Sleep(backoff)
-			// Rebuild request body since it was already consumed
 			req, _ = http.NewRequest("POST", endpoint, bytes.NewReader(payload))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("Accept", "application/json")
+			req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 			req.Header.Set("Origin", "https://checkout.pci.shopifyinc.com")
-			req.Header.Set("Referer", "https://checkout.pci.shopifyinc.com/")
-			req.Header.Set("Sec-Fetch-Site", "cross-site")
-			req.Header.Set("Sec-Fetch-Mode", "cors")
-			req.Header.Set("Sec-Fetch-Dest", "empty")
+			req.Header.Set("Referer", "https://checkout.pci.shopifyinc.com/build/a8e4a94/number-ltr.html?identifier=&locationURL=")
 			req.Header.Set("Sec-CH-UA", cs.FP.SecCHUA)
 			req.Header.Set("Sec-CH-UA-Mobile", cs.FP.SecCHUAMobile)
 			req.Header.Set("Sec-CH-UA-Platform", cs.FP.SecCHUAPlatform)
+			req.Header.Set("Sec-Fetch-Dest", "empty")
+			req.Header.Set("Sec-Fetch-Mode", "cors")
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+			req.Header.Set("Sec-Fetch-Storage-Access", "active")
 			req.Header.Set("User-Agent", cs.FP.UserAgent)
+			if cs.IdentificationSignature != "" {
+				req.Header.Set("shopify-identification-signature", cs.IdentificationSignature)
+			}
 		}
 		resp, err = tokenClient.Do(req)
 		if err != nil {
@@ -338,107 +626,529 @@ func (cs *CheckoutSession) Step2TokenizeCard() error {
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return fmt.Errorf("tokenize JSON decode: %w", err)
 	}
-
 	if tokenResp.ID == "" {
-		return fmt.Errorf("no card session ID returned (errors: %v)", tokenResp.Errors)
+		return fmt.Errorf("no card session ID (errors: %v)", tokenResp.Errors)
 	}
 
 	cs.CardSessionID = tokenResp.ID
-	fmt.Printf("  [OK] Card session ID: %s\n", tokenResp.ID)
+	fmt.Printf("  PCI session: %s\n", tokenResp.ID)
 	return nil
 }
 
-// ─── Step 3: Submit initial proposal & poll for shipping ─────────────────────
+// ─── Proposal Helpers ────────────────────────────────────────────────────────
 
-func (cs *CheckoutSession) Step3Proposal() error {
-	fmt.Println("[3/5] Submitting proposal...")
+// patchPayload replaces hardcoded USD/US with detected currency/country
+func (cs *CheckoutSession) patchPayload(payload string) string {
+	currency := cs.CurrencyCode
+	if currency == "" {
+		currency = "USD"
+	}
+	country := cs.DetectedCountry
+	if country == "" {
+		country = cs.Addr.Country
+	}
+	if country == "" {
+		country = "US"
+	}
 
-	time.Sleep(jitter(100, 300))
+	if currency != "USD" {
+		payload = strings.ReplaceAll(payload, `"currencyCode": "USD"`, `"currencyCode": "`+currency+`"`)
+		payload = strings.ReplaceAll(payload, `"presentmentCurrency": "USD"`, `"presentmentCurrency": "`+currency+`"`)
+	}
+	if country != "US" {
+		payload = strings.ReplaceAll(payload, `"phoneCountryCode": "US"`, `"phoneCountryCode": "`+country+`"`)
+	}
+	return payload
+}
 
-	cs.MerchandiseID = uuid.New().String()
-	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=Proposal"
+// sendProposalRaw sends a raw proposal payload and returns body
+func (cs *CheckoutSession) sendProposalRaw(payload string) (string, error) {
+	gqlURL := cs.ShopURL + "/checkouts/internal/graphql/persisted?operationName=Proposal"
 
-	payload := cs.buildProposalPayload(ProposalFullQuery, "any", "", false)
-	payloadBytes, _ := json.Marshal(addAPQExtensions(payload))
+	req, err := http.NewRequest("POST", gqlURL, strings.NewReader(payload))
+	if err != nil {
+		return "", fmt.Errorf("proposal build: %w", err)
+	}
+	req.Header = cs.graphqlHeaders()
 
-	// Retry on 429
 	var body []byte
 	for attempt := range 3 {
-		req, _ := http.NewRequest("POST", gqlURL, bytes.NewReader(payloadBytes))
-		req.Header = cs.graphqlHeaders()
+		if attempt > 0 {
+			wait := 1.5 + float64(attempt)*1.5 + rand.Float64()
+			time.Sleep(time.Duration(wait * float64(time.Second)))
+			req, _ = http.NewRequest("POST", gqlURL, strings.NewReader(payload))
+			req.Header = cs.graphqlHeaders()
+		}
 		resp, err := cs.Client.Do(req)
 		if err != nil {
-			return fmt.Errorf("proposal POST: %w", err)
+			if attempt < 2 {
+				continue
+			}
+			return "", fmt.Errorf("proposal POST: %w", err)
 		}
 		decompressBody(resp)
 		body, _ = io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode == 429 {
-			wait := 2.0 + float64(attempt)*2.0 + rand.Float64()
-			fmt.Printf("  [RATE-LIMITED] 429 on proposal (attempt %d/3), waiting %.1fs...\n", attempt+1, wait)
-			time.Sleep(time.Duration(wait * float64(time.Second)))
-			continue
+			if attempt < 2 {
+				continue
+			}
+			return "", fmt.Errorf("proposal rate limited: 429")
 		}
 		if resp.StatusCode != 200 {
-			return fmt.Errorf("proposal HTTP %d", resp.StatusCode)
+			return "", fmt.Errorf("proposal HTTP %d", resp.StatusCode)
 		}
 		break
 	}
 
-	var response map[string]any
-	if err := json.Unmarshal(body, &response); err != nil {
-		return fmt.Errorf("proposal JSON decode: %w", err)
+	return string(body), nil
+}
+
+// ─── Step 3: Five Proposal Rounds ────────────────────────────────────────────
+
+func (cs *CheckoutSession) Step3Proposal() error {
+	fmt.Println("[3/5] Proposals (5 rounds)...")
+
+	email := cs.Addr.Email
+
+	// ── Round 1: Initial proposal (empty address, no email, no queueToken) ──
+	fmt.Println("  [3.1] Initial proposal...")
+	payload1 := cs.buildProposal1()
+	body1, err := cs.sendProposalRaw(payload1)
+	if err != nil {
+		return fmt.Errorf("proposal round 1: %w", err)
 	}
 
-	// Check for GraphQL errors
-	if errs, ok := response["errors"]; ok {
-		return fmt.Errorf("GraphQL errors: %v", errs)
+	if cur := extractSellerCurrencyStr(body1); cur != "" {
+		cs.CurrencyCode = cur
+	}
+	if ctr := extractSellerCountryStr(body1); ctr != "" {
+		cs.DetectedCountry = ctr
+	}
+	if sellerPrice := extractSellerMerchandisePriceStr(body1); sellerPrice != "" {
+		fmt.Printf("  Seller price: %s\n", sellerPrice)
 	}
 
-	// Navigate response
-	result := navigateMap(response, "data", "session", "negotiate", "result")
-	if getString(result, "__typename") != "NegotiationResultAvailable" {
-		return fmt.Errorf("proposal result not available: %v", getString(result, "__typename"))
+	qt1 := extractQueueTokenStr(body1)
+	if qt1 == "" {
+		return fmt.Errorf("queueToken not found in proposal round 1")
 	}
 
-	cs.QueueToken = getString(result, "queueToken")
-	sellerProposal := getMap(result, "sellerProposal")
-
-	// Detect phone requirement
-	cs.PhoneRequired = cs.detectPhoneRequired(sellerProposal)
-
-	// Extract shipping handle
-	deliveryTerms := getMap(sellerProposal, "delivery")
-	if getString(deliveryTerms, "__typename") == "FilledDeliveryTerms" {
-		cs.extractShipping(deliveryTerms)
+	// ── Round 2: Proposal with email ──
+	fmt.Println("  [3.2] Email proposal...")
+	payload2 := cs.buildProposal2(qt1, email)
+	body2, err := cs.sendProposalRaw(payload2)
+	if err != nil {
+		return fmt.Errorf("proposal round 2: %w", err)
+	}
+	qt2 := extractQueueTokenStr(body2)
+	if qt2 == "" {
+		return fmt.Errorf("queueToken not found in proposal round 2")
 	}
 
-	// Extract total
-	cs.extractTotal(sellerProposal)
+	// ── Round 3: Proposal with address ──
+	fmt.Println("  [3.3] Address proposal...")
+	payload3 := cs.buildProposal3(qt2, email)
+	body3, err := cs.sendProposalRaw(payload3)
+	if err != nil {
+		return fmt.Errorf("proposal round 3: %w", err)
+	}
+	qt3 := extractQueueTokenStr(body3)
+	if qt3 == "" {
+		return fmt.Errorf("queueToken not found in proposal round 3")
+	}
 
-	// Extract delivery expectations
-	cs.extractDeliveryExpectations(sellerProposal)
+	// ── Round 4: Delivery poll (same as round 3 — let delivery settle) ──
+	fmt.Println("  [3.4] Delivery proposal...")
+	time.Sleep(500 * time.Millisecond)
+	payload4 := cs.buildProposal3(qt3, email)
+	body4, err := cs.sendProposalRaw(payload4)
+	if err != nil {
+		return fmt.Errorf("proposal round 4: %w", err)
+	}
+	qt4 := extractQueueTokenStr(body4)
+	if qt4 == "" {
+		return fmt.Errorf("queueToken not found in proposal round 4")
+	}
 
-	// If expectations are still pending, poll for them
-	expTerms := getMap(sellerProposal, "deliveryExpectations")
-	if getString(expTerms, "__typename") == "PendingTerms" {
-		if getString(deliveryTerms, "__typename") == "PendingTerms" {
-			// Both pending — full poll
-			fmt.Println("  [INFO] Both delivery and expectations pending - polling...")
-			cs.pollFullDelivery()
-		} else if cs.ShippingHandle != "" {
-			// Only expectations pending
-			fmt.Printf("  [INFO] Polling expectations with handle: %s...\n", truncate(cs.ShippingHandle, 50))
-			cs.pollExpectations()
+	// ── Round 5: Final proposal (extract delivery data) ──
+	fmt.Println("  [3.5] Final proposal...")
+	time.Sleep(500 * time.Millisecond)
+	payload5 := cs.buildProposal3(qt4, email)
+	body5, err := cs.sendProposalRaw(payload5)
+	if err != nil {
+		return fmt.Errorf("proposal round 5: %w", err)
+	}
+
+	cs.QueueToken = extractQueueTokenStr(body5)
+	if cs.QueueToken == "" {
+		return fmt.Errorf("queueToken not found in final proposal")
+	}
+
+	cs.ShippingHandle = extractDeliveryHandleStr(body5)
+	if cs.ShippingHandle == "" {
+		var resp map[string]any
+		if json.Unmarshal([]byte(body5), &resp) == nil {
+			result := navigateMap(resp, "data", "session", "negotiate", "result")
+			sp := getMap(result, "sellerProposal")
+			dt := getMap(sp, "delivery")
+			if getString(dt, "__typename") == "FilledDeliveryTerms" {
+				lines := getSlice(dt, "deliveryLines")
+				if len(lines) > 0 {
+					firstLine, _ := lines[0].(map[string]any)
+					strategies := getSlice(firstLine, "availableDeliveryStrategies")
+					if len(strategies) > 0 {
+						first, _ := strategies[0].(map[string]any)
+						cs.ShippingHandle = getString(first, "handle")
+					}
+				}
+			}
 		}
 	}
-
-	fmt.Printf("  [INFO] Phone Required: %v\n", cs.PhoneRequired)
 	if cs.ShippingHandle == "" {
 		return fmt.Errorf("no shipping handle obtained")
 	}
+
+	cs.ShippingAmount = extractShippingAmountStr(body5)
+	if cs.ShippingAmount == "" {
+		cs.ShippingAmount = "0.00"
+	}
+
+	totalAmount := extractCheckoutTotalStr(body5)
+	if totalAmount == "" {
+		totalAmount = extractSellerTotalStr(body5)
+	}
+	if totalAmount != "" {
+		cs.ActualTotal = totalAmount
+	}
+
+	signedHandles := extractSignedHandlesStr(body5)
+	cs.DeliveryExps = nil
+	for _, sh := range signedHandles {
+		cs.DeliveryExps = append(cs.DeliveryExps, map[string]string{"signedHandle": sh})
+	}
+
+	fmt.Printf("  Handle: %s Shipping: %s Total: %s\n",
+		truncate(cs.ShippingHandle, 30), cs.ShippingAmount, cs.ActualTotal)
+
 	return nil
+}
+
+// buildProposal1 builds the initial proposal payload (no email, no queueToken, empty address)
+func (cs *CheckoutSession) buildProposal1() string {
+	p := fmt.Sprintf(`{
+  "variables": {
+    "sessionInput": {"sessionToken": %s},
+    "queueToken": null,
+    "discounts": {"lines": [], "acceptUnexpectedDiscounts": true},
+    "delivery": {
+      "deliveryLines": [{
+        "destination": {
+          "partialStreetAddress": {
+            "address1": "", "city": "", "countryCode": "US",
+            "lastName": "", "phone": "", "oneTimeUse": false
+          }
+        },
+        "selectedDeliveryStrategy": {
+          "deliveryStrategyMatchingConditions": {
+            "estimatedTimeInTransit": {"any": true},
+            "shipments": {"any": true}
+          },
+          "options": {}
+        },
+        "targetMerchandiseLines": {"any": true},
+        "deliveryMethodTypes": ["SHIPPING"],
+        "expectedTotalPrice": {"any": true},
+        "destinationChanged": true
+      }],
+      "noDeliveryRequired": [],
+      "useProgressiveRates": false,
+      "prefetchShippingRatesStrategy": null,
+      "supportsSplitShipping": true
+    },
+    "deliveryExpectations": {"deliveryExpectationLines": []},
+    "merchandise": {
+      "merchandiseLines": [{
+        "stableId": %s,
+        "merchandise": {
+          "productVariantReference": {
+            "id": "gid://shopify/ProductVariantMerchandise/%s",
+            "variantId": "gid://shopify/ProductVariant/%s",
+            "properties": [], "sellingPlanId": null, "sellingPlanDigest": null
+          }
+        },
+        "quantity": {"items": {"value": 1}},
+        "expectedTotalPrice": {"any": true},
+        "lineComponentsSource": null,
+        "lineComponents": []
+      }]
+    },
+    "memberships": {"memberships": []},
+    "payment": {
+      "totalAmount": {"any": true},
+      "paymentLines": [],
+      "billingAddress": {
+        "streetAddress": {
+          "address1": "", "city": "", "countryCode": "US",
+          "lastName": "", "phone": ""
+        }
+      }
+    },
+    "buyerIdentity": {
+      "customer": {"presentmentCurrency": "USD", "countryCode": "US"},
+      "phoneCountryCode": "US",
+      "marketingConsent": [],
+      "shopPayOptInPhone": {"countryCode": "US"},
+      "rememberMe": false
+    },
+    "tip": {"tipLines": []},
+    "poNumber": null,
+    "taxes": {
+      "proposedAllocations": null,
+      "proposedTotalAmount": {"any": true},
+      "proposedTotalIncludedAmount": null,
+      "proposedMixedStateTotalAmount": null,
+      "proposedExemptions": []
+    },
+    "note": {"message": null, "customAttributes": []},
+    "localizationExtension": {"fields": []},
+    "nonNegotiableTerms": null,
+    "scriptFingerprint": {
+      "signature": null, "signatureUuid": null,
+      "lineItemScriptChanges": [], "paymentScriptChanges": [], "shippingScriptChanges": []
+    },
+    "optionalDuties": {"buyerRefusesDuties": false},
+    "cartMetafields": []
+  },
+  "operationName": "Proposal",
+  "id": %s
+}`,
+		strconv.Quote(cs.SessionToken),
+		strconv.Quote(cs.StableID), cs.VariantID, cs.VariantID,
+		strconv.Quote(cs.ProposalID))
+	return cs.patchPayload(p)
+}
+
+// buildProposal2 builds the email proposal payload (with queueToken + email)
+func (cs *CheckoutSession) buildProposal2(queueToken, email string) string {
+	p := fmt.Sprintf(`{
+  "variables": {
+    "sessionInput": {"sessionToken": %s},
+    "queueToken": %s,
+    "discounts": {"lines": [], "acceptUnexpectedDiscounts": true},
+    "delivery": {
+      "deliveryLines": [{
+        "destination": {
+          "partialStreetAddress": {
+            "address1": "", "city": "", "countryCode": "US",
+            "lastName": "", "phone": "", "oneTimeUse": false
+          }
+        },
+        "selectedDeliveryStrategy": {
+          "deliveryStrategyMatchingConditions": {
+            "estimatedTimeInTransit": {"any": true},
+            "shipments": {"any": true}
+          },
+          "options": {}
+        },
+        "targetMerchandiseLines": {"any": true},
+        "deliveryMethodTypes": ["SHIPPING"],
+        "expectedTotalPrice": {"any": true},
+        "destinationChanged": true
+      }],
+      "noDeliveryRequired": [],
+      "useProgressiveRates": false,
+      "prefetchShippingRatesStrategy": null,
+      "supportsSplitShipping": true
+    },
+    "deliveryExpectations": {"deliveryExpectationLines": []},
+    "merchandise": {
+      "merchandiseLines": [{
+        "stableId": %s,
+        "merchandise": {
+          "productVariantReference": {
+            "id": "gid://shopify/ProductVariantMerchandise/%s",
+            "variantId": "gid://shopify/ProductVariant/%s",
+            "properties": [], "sellingPlanId": null, "sellingPlanDigest": null
+          }
+        },
+        "quantity": {"items": {"value": 1}},
+        "expectedTotalPrice": {"any": true},
+        "lineComponentsSource": null,
+        "lineComponents": []
+      }]
+    },
+    "memberships": {"memberships": []},
+    "payment": {
+      "totalAmount": {"any": true},
+      "paymentLines": [],
+      "billingAddress": {
+        "streetAddress": {
+          "address1": "", "city": "", "countryCode": "US",
+          "lastName": "", "phone": ""
+        }
+      }
+    },
+    "buyerIdentity": {
+      "customer": {"presentmentCurrency": "USD", "countryCode": "US"},
+      "email": %s,
+      "emailChanged": true,
+      "phoneCountryCode": "US",
+      "marketingConsent": [],
+      "shopPayOptInPhone": {"countryCode": "US"},
+      "rememberMe": false
+    },
+    "tip": {"tipLines": []},
+    "poNumber": null,
+    "taxes": {
+      "proposedAllocations": null,
+      "proposedTotalAmount": {"any": true},
+      "proposedTotalIncludedAmount": null,
+      "proposedMixedStateTotalAmount": null,
+      "proposedExemptions": []
+    },
+    "note": {"message": null, "customAttributes": []},
+    "localizationExtension": {"fields": []},
+    "nonNegotiableTerms": null,
+    "scriptFingerprint": {
+      "signature": null, "signatureUuid": null,
+      "lineItemScriptChanges": [], "paymentScriptChanges": [], "shippingScriptChanges": []
+    },
+    "optionalDuties": {"buyerRefusesDuties": false},
+    "cartMetafields": []
+  },
+  "operationName": "Proposal",
+  "id": %s
+}`,
+		strconv.Quote(cs.SessionToken), strconv.Quote(queueToken),
+		strconv.Quote(cs.StableID), cs.VariantID, cs.VariantID,
+		strconv.Quote(email),
+		strconv.Quote(cs.ProposalID))
+	return cs.patchPayload(p)
+}
+
+// buildProposal3 builds the full address proposal payload
+func (cs *CheckoutSession) buildProposal3(queueToken, email string) string {
+	addr := cs.Addr
+	country := addr.Country
+	if country == "" {
+		country = "US"
+	}
+	province := addr.Province
+	phone := addr.Phone
+	if phone == "" {
+		phone = "+12125550100"
+	}
+
+	p := fmt.Sprintf(`{
+  "variables": {
+    "sessionInput": {"sessionToken": %s},
+    "queueToken": %s,
+    "discounts": {"lines": [], "acceptUnexpectedDiscounts": true},
+    "delivery": {
+      "deliveryLines": [{
+        "destination": {
+          "partialStreetAddress": {
+            "address1": %s, "address2": "",
+            "city": %s, "countryCode": %s,
+            "postalCode": %s, "firstName": %s,
+            "lastName": %s, "zoneCode": %s,
+            "phone": %s, "oneTimeUse": false
+          }
+        },
+        "selectedDeliveryStrategy": {
+          "deliveryStrategyMatchingConditions": {
+            "estimatedTimeInTransit": {"any": true},
+            "shipments": {"any": true}
+          },
+          "options": {}
+        },
+        "targetMerchandiseLines": {"any": true},
+        "deliveryMethodTypes": ["SHIPPING"],
+        "expectedTotalPrice": {"any": true},
+        "destinationChanged": true
+      }],
+      "noDeliveryRequired": [],
+      "useProgressiveRates": false,
+      "prefetchShippingRatesStrategy": null,
+      "supportsSplitShipping": true
+    },
+    "deliveryExpectations": {"deliveryExpectationLines": []},
+    "merchandise": {
+      "merchandiseLines": [{
+        "stableId": %s,
+        "merchandise": {
+          "productVariantReference": {
+            "id": "gid://shopify/ProductVariantMerchandise/%s",
+            "variantId": "gid://shopify/ProductVariant/%s",
+            "properties": [], "sellingPlanId": null, "sellingPlanDigest": null
+          }
+        },
+        "quantity": {"items": {"value": 1}},
+        "expectedTotalPrice": {"any": true},
+        "lineComponentsSource": null,
+        "lineComponents": []
+      }]
+    },
+    "memberships": {"memberships": []},
+    "payment": {
+      "totalAmount": {"any": true},
+      "paymentLines": [],
+      "billingAddress": {
+        "streetAddress": {
+          "address1": %s, "address2": "",
+          "city": %s, "countryCode": %s,
+          "postalCode": %s, "firstName": %s,
+          "lastName": %s, "zoneCode": %s,
+          "phone": %s
+        }
+      }
+    },
+    "buyerIdentity": {
+      "customer": {"presentmentCurrency": "USD", "countryCode": "US"},
+      "email": %s,
+      "emailChanged": false,
+      "phoneCountryCode": "US",
+      "marketingConsent": [],
+      "shopPayOptInPhone": {"countryCode": "US"},
+      "rememberMe": false
+    },
+    "tip": {"tipLines": []},
+    "poNumber": null,
+    "taxes": {
+      "proposedAllocations": null,
+      "proposedTotalAmount": {"any": true},
+      "proposedTotalIncludedAmount": null,
+      "proposedMixedStateTotalAmount": null,
+      "proposedExemptions": []
+    },
+    "note": {"message": null, "customAttributes": []},
+    "localizationExtension": {"fields": []},
+    "nonNegotiableTerms": null,
+    "scriptFingerprint": {
+      "signature": null, "signatureUuid": null,
+      "lineItemScriptChanges": [], "paymentScriptChanges": [], "shippingScriptChanges": []
+    },
+    "optionalDuties": {"buyerRefusesDuties": false},
+    "cartMetafields": []
+  },
+  "operationName": "Proposal",
+  "id": %s
+}`,
+		strconv.Quote(cs.SessionToken), strconv.Quote(queueToken),
+		strconv.Quote(addr.Address1), strconv.Quote(addr.City), strconv.Quote(country),
+		strconv.Quote(addr.Zip), strconv.Quote(addr.FirstName),
+		strconv.Quote(addr.LastName), strconv.Quote(province),
+		strconv.Quote(phone),
+		strconv.Quote(cs.StableID), cs.VariantID, cs.VariantID,
+		strconv.Quote(addr.Address1), strconv.Quote(addr.City), strconv.Quote(country),
+		strconv.Quote(addr.Zip), strconv.Quote(addr.FirstName),
+		strconv.Quote(addr.LastName), strconv.Quote(province),
+		strconv.Quote(phone),
+		strconv.Quote(email),
+		strconv.Quote(cs.ProposalID))
+	return cs.patchPayload(p)
 }
 
 // ─── Step 4: Submit for completion ───────────────────────────────────────────
@@ -454,87 +1164,212 @@ type SubmitResult struct {
 func (cs *CheckoutSession) Step4Submit() SubmitResult {
 	fmt.Println("[4/5] Submitting for completion...")
 
-	time.Sleep(jitter(100, 300))
+	time.Sleep(jitter(100, 200))
 
-	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=SubmitForCompletion"
-	attemptToken := fmt.Sprintf("%s-%s", cs.CheckoutToken, uuid.New().String()[:10])
+	addr := cs.Addr
+	country := addr.Country
+	if country == "" {
+		country = "US"
+	}
+	province := addr.Province
+	phone := addr.Phone
+	if phone == "" {
+		phone = "+12125550100"
+	}
+	email := addr.Email
 
-	// Build delivery line config with full address (matches Python get_delivery_line_config)
-	deliveryLine := cs.buildDeliveryLine(cs.ShippingHandle, cs.MerchandiseID, true, true, false)
-
-	billingAddr := cs.billingAddress()
-
-	// Delivery expectation lines (placed at TOP-LEVEL of input, NOT inside delivery block)
-	var expLines []map[string]string
+	var handleLines []string
 	for _, exp := range cs.DeliveryExps {
-		expLines = append(expLines, map[string]string{"signedHandle": exp["signedHandle"]})
+		h := exp["signedHandle"]
+		if h != "" {
+			handleLines = append(handleLines, fmt.Sprintf(`{"signedHandle":%s}`, strconv.Quote(h)))
+		}
+	}
+	signedHandlesJSON := "[]"
+	if len(handleLines) > 0 {
+		signedHandlesJSON = "[" + strings.Join(handleLines, ",") + "]"
 	}
 
-	// Delivery block WITHOUT expectations (per Python reference)
-	deliveryBlock := map[string]any{
-		"deliveryLines":      []any{deliveryLine},
-		"noDeliveryRequired": []any{},
+	totalAmount := cs.ActualTotal
+	if totalAmount == "" {
+		totalAmount = "0.00"
 	}
 
-	// Payment amounts: use actual total+currency from proposal when available,
-	// fall back to {any: true} when total is missing
 	currency := cs.CurrencyCode
 	if currency == "" {
 		currency = "USD"
 	}
-	paymentTotalAmount := map[string]any{"any": true}
-	paymentLineAmount := map[string]any{"any": true}
-	if cs.ActualTotal != "" {
-		totalF := parsePrice(cs.ActualTotal)
-		if totalF > 0 {
-			amountVal := map[string]any{"amount": totalF, "currencyCode": currency}
-			paymentTotalAmount = map[string]any{"value": amountVal}
-			paymentLineAmount = map[string]any{"value": amountVal}
-		}
-	}
 
-	inputData := map[string]any{
-		"sessionInput": map[string]any{"sessionToken": cs.SessionToken},
-		"queueToken":   cs.QueueToken,
-		"discounts":    map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
-		"delivery":     deliveryBlock,
-		"merchandise":  cs.merchandiseBlock(false),
-		"payment": map[string]any{
-			"totalAmount": paymentTotalAmount,
-			"paymentLines": []any{
-				map[string]any{
-					"paymentMethod": map[string]any{
-						"directPaymentMethod": map[string]any{
-							"sessionId":      cs.CardSessionID,
-							"billingAddress": map[string]any{"streetAddress": billingAddr},
-						},
-					},
-					"amount": paymentLineAmount,
-				},
-			},
-			"billingAddress": map[string]any{"streetAddress": billingAddr},
-		},
-		"buyerIdentity": cs.buyerIdentity(),
-		"taxes":         map[string]any{"proposedTotalAmount": map[string]any{"any": true}},
-	}
-	// deliveryExpectations at top-level of input (NOT inside delivery block), per Python reference
-	if len(expLines) > 0 {
-		inputData["deliveryExpectations"] = map[string]any{
-			"deliveryExpectationLines": expLines,
-		}
-	}
+	attemptToken := generateAttemptToken(cs.CheckoutToken)
+	pageID := generatePageID()
 
-	payload := addAPQExtensions(map[string]any{
-		"operationName": "SubmitForCompletion",
-		"query":         SubmitCompletionQuery,
-		"variables": map[string]any{
-			"attemptToken": attemptToken,
-			"input":        inputData,
-		},
-	})
+	gqlPayload := fmt.Sprintf(`{
+  "variables": {
+    "input": {
+      "sessionInput": {"sessionToken": %s},
+      "queueToken": %s,
+      "discounts": {"lines": [], "acceptUnexpectedDiscounts": true},
+      "delivery": {
+        "deliveryLines": [{
+          "destination": {
+            "streetAddress": {
+              "address1": %s, "address2": "",
+              "city": %s, "countryCode": %s,
+              "postalCode": %s, "firstName": %s,
+              "lastName": %s, "zoneCode": %s,
+              "phone": %s, "oneTimeUse": false
+            }
+          },
+          "selectedDeliveryStrategy": {
+            "deliveryStrategyByHandle": {
+              "handle": %s,
+              "customDeliveryRate": false
+            },
+            "options": {}
+          },
+          "targetMerchandiseLines": {
+            "lines": [{"stableId": %s}]
+          },
+          "deliveryMethodTypes": ["SHIPPING"],
+          "expectedTotalPrice": {"any": true},
+          "destinationChanged": false
+        }],
+        "noDeliveryRequired": [],
+        "useProgressiveRates": false,
+        "prefetchShippingRatesStrategy": null,
+        "supportsSplitShipping": true
+      },
+      "deliveryExpectations": {
+        "deliveryExpectationLines": %s
+      },
+      "merchandise": {
+        "merchandiseLines": [{
+          "stableId": %s,
+          "merchandise": {
+            "productVariantReference": {
+              "id": "gid://shopify/ProductVariantMerchandise/%s",
+              "variantId": "gid://shopify/ProductVariant/%s",
+              "properties": [], "sellingPlanId": null, "sellingPlanDigest": null
+            }
+          },
+          "quantity": {"items": {"value": 1}},
+          "expectedTotalPrice": {"any": true},
+          "lineComponentsSource": null,
+          "lineComponents": []
+        }]
+      },
+      "memberships": {"memberships": []},
+      "payment": {
+        "totalAmount": {"value": {"amount": %s, "currencyCode": %s}},
+        "paymentLines": [{
+          "paymentMethod": {
+            "directPaymentMethod": {
+              "sessionId": %s,
+              "billingAddress": {
+                "streetAddress": {
+                  "address1": %s, "address2": "",
+                  "city": %s, "countryCode": %s,
+                  "postalCode": %s, "firstName": %s,
+                  "lastName": %s, "zoneCode": %s,
+                  "phone": %s
+                }
+              },
+              "cardSource": null
+            },
+            "giftCardPaymentMethod": null,
+            "redeemablePaymentMethod": null,
+            "walletPaymentMethod": null,
+            "walletsPlatformPaymentMethod": null,
+            "localPaymentMethod": null,
+            "paymentOnDeliveryMethod": null,
+            "paymentOnDeliveryMethod2": null,
+            "manualPaymentMethod": null,
+            "customPaymentMethod": null,
+            "offsitePaymentMethod": null,
+            "customOnsitePaymentMethod": null,
+            "deferredPaymentMethod": null,
+            "customerCreditCardPaymentMethod": null,
+            "paypalBillingAgreementPaymentMethod": null,
+            "remotePaymentInstrument": null
+          },
+          "amount": {"value": {"amount": %s, "currencyCode": %s}}
+        }],
+        "billingAddress": {
+          "streetAddress": {
+            "address1": %s, "address2": "",
+            "city": %s, "countryCode": %s,
+            "postalCode": %s, "firstName": %s,
+            "lastName": %s, "zoneCode": %s,
+            "phone": %s
+          }
+        }
+      },
+      "buyerIdentity": {
+        "customer": {"presentmentCurrency": %s, "countryCode": "US"},
+        "email": %s,
+        "emailChanged": false,
+        "phoneCountryCode": "US",
+        "marketingConsent": [],
+        "shopPayOptInPhone": {"countryCode": "US"},
+        "rememberMe": false
+      },
+      "tip": {"tipLines": []},
+      "taxes": {
+        "proposedAllocations": null,
+        "proposedTotalAmount": {"any": true},
+        "proposedTotalIncludedAmount": null,
+        "proposedMixedStateTotalAmount": null,
+        "proposedExemptions": []
+      },
+      "note": {"message": null, "customAttributes": []},
+      "localizationExtension": {"fields": []},
+      "nonNegotiableTerms": null,
+      "scriptFingerprint": {
+        "signature": null, "signatureUuid": null,
+        "lineItemScriptChanges": [], "paymentScriptChanges": [], "shippingScriptChanges": []
+      },
+      "optionalDuties": {"buyerRefusesDuties": false},
+      "cartMetafields": []
+    },
+    "attemptToken": %s,
+    "metafields": [],
+    "analytics": {
+      "requestUrl": %s,
+      "pageId": %s
+    }
+  },
+  "operationName": "SubmitForCompletion",
+  "id": %s
+}`,
+		strconv.Quote(cs.SessionToken), strconv.Quote(cs.QueueToken),
+		strconv.Quote(addr.Address1), strconv.Quote(addr.City), strconv.Quote(country),
+		strconv.Quote(addr.Zip), strconv.Quote(addr.FirstName),
+		strconv.Quote(addr.LastName), strconv.Quote(province),
+		strconv.Quote(phone),
+		strconv.Quote(cs.ShippingHandle),
+		strconv.Quote(cs.StableID),
+		signedHandlesJSON,
+		strconv.Quote(cs.StableID), cs.VariantID, cs.VariantID,
+		strconv.Quote(totalAmount), strconv.Quote(currency),
+		strconv.Quote(cs.CardSessionID),
+		strconv.Quote(addr.Address1), strconv.Quote(addr.City), strconv.Quote(country),
+		strconv.Quote(addr.Zip), strconv.Quote(addr.FirstName),
+		strconv.Quote(addr.LastName), strconv.Quote(province),
+		strconv.Quote(phone),
+		strconv.Quote(totalAmount), strconv.Quote(currency),
+		strconv.Quote(addr.Address1), strconv.Quote(addr.City), strconv.Quote(country),
+		strconv.Quote(addr.Zip), strconv.Quote(addr.FirstName),
+		strconv.Quote(addr.LastName), strconv.Quote(province),
+		strconv.Quote(phone),
+		strconv.Quote(currency), strconv.Quote(email),
+		strconv.Quote(attemptToken), strconv.Quote(cs.CheckoutURL), strconv.Quote(pageID),
+		strconv.Quote(cs.SubmitID))
 
-	payloadBytes, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("POST", gqlURL, bytes.NewReader(payloadBytes))
+	gqlPayload = cs.patchPayload(gqlPayload)
+
+	gqlURL := cs.ShopURL + "/checkouts/internal/graphql/persisted?operationName=SubmitForCompletion"
+
+	req, _ := http.NewRequest("POST", gqlURL, strings.NewReader(gqlPayload))
 	req.Header = cs.graphqlHeaders()
 
 	resp, err := cs.Client.Do(req)
@@ -557,14 +1392,19 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 	result := getMap(response, "data")
 	submitResult := getMap(result, "submitForCompletion")
 	resultType := getString(submitResult, "__typename")
-	fmt.Printf("  [INFO] Result: %s\n", resultType)
+	fmt.Printf("  Submit result: %s\n", resultType)
 
 	switch resultType {
 	case "SubmitSuccess", "SubmitAlreadyAccepted", "SubmittedForCompletion":
 		receipt := getMap(submitResult, "receipt")
 		receiptID := getString(receipt, "id")
+		bodyStr := string(body)
+		re := regexp.MustCompile(`"sessionToken"\s*:\s*"([^"]+)"`)
+		if m := re.FindStringSubmatch(bodyStr); len(m) > 1 {
+			cs.ReceiptSessionToken = m[1]
+		}
 		if receiptID != "" {
-			fmt.Printf("  [SUCCESS] Receipt ID: %s\n", receiptID)
+			fmt.Printf("  Receipt ID: %s\n", receiptID)
 			return SubmitResult{ReceiptID: receiptID, Code: "SUBMIT_SUCCESS", Response: response, Total: cs.ActualTotal}
 		}
 		return SubmitResult{ReceiptID: "ACCEPTED", Code: "SUBMIT_ACCEPTED", Response: response, Total: cs.ActualTotal}
@@ -578,7 +1418,7 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 			msg := getString(em, "localizedMessage")
 			codes = append(codes, code)
 			msgs = append(msgs, msg)
-			fmt.Printf("  [ERROR] %s: %s\n", code, msg)
+			fmt.Printf("  [REJECTED] %s: %s\n", code, msg)
 		}
 		primaryCode := "SUBMIT_REJECTED"
 		if len(codes) > 0 {
@@ -598,35 +1438,44 @@ func (cs *CheckoutSession) Step4Submit() SubmitResult {
 	}
 }
 
-// ─── Step 5: Poll for receipt ────────────────────────────────────────────────
+// ─── Step 5: Poll for receipt (GET-based, V2) ───────────────────────────────
 
 func (cs *CheckoutSession) Step5PollReceipt(receiptID string) (bool, string, map[string]any) {
-	fmt.Println("[5/5] Polling for receipt...")
-
-	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=PollForReceipt"
+	fmt.Println("[5/5] Polling receipt...")
 
 	if !strings.HasPrefix(receiptID, "gid://shopify/") {
 		return false, `"code": "INVALID_RECEIPT_ID"`, nil
 	}
 
-	payload := addAPQExtensions(map[string]any{
-		"operationName": "PollForReceipt",
-		"query":         PollReceiptQuery,
-		"variables": map[string]any{
-			"receiptId":    receiptID,
-			"sessionToken": cs.SessionToken,
-		},
-	})
+	sessionToken := cs.ReceiptSessionToken
+	if sessionToken == "" {
+		sessionToken = cs.SessionToken
+	}
+
+	gqlURL := cs.ShopURL + "/checkouts/internal/graphql/persisted"
 
 	var lastResponse map[string]any
 	errorStrikes := 0
 
 	for attempt := 1; attempt <= cfg.PollReceiptMax; attempt++ {
-		fmt.Printf("  Polling %d/%d...\n", attempt, cfg.PollReceiptMax)
+		fmt.Printf("  Poll %d/%d...\n", attempt, cfg.PollReceiptMax)
 
-		payloadBytes, _ := json.Marshal(payload)
-		req, _ := http.NewRequest("POST", gqlURL, bytes.NewReader(payloadBytes))
-		req.Header = cs.graphqlHeaders()
+		varsJSON := fmt.Sprintf(`{"receiptId":%s,"sessionToken":%s}`,
+			strconv.Quote(receiptID), strconv.Quote(sessionToken))
+
+		params := url.Values{}
+		params.Set("operationName", "PollForReceipt")
+		params.Set("variables", varsJSON)
+		params.Set("id", cs.PollForReceiptID)
+
+		fullURL := gqlURL + "?" + params.Encode()
+
+		req, err := http.NewRequest("GET", fullURL, nil)
+		if err != nil {
+			time.Sleep(cfg.ShortSleep)
+			continue
+		}
+		req.Header = cs.graphqlHeadersPoll()
 
 		resp, err := cs.Client.Do(req)
 		if err != nil {
@@ -651,7 +1500,6 @@ func (cs *CheckoutSession) Step5PollReceipt(receiptID string) (bool, string, map
 		}
 		lastResponse = response
 
-		// Check for errors without data
 		if _, hasErrors := response["errors"]; hasErrors {
 			if _, hasData := response["data"]; !hasData {
 				errorStrikes++
@@ -668,16 +1516,16 @@ func (cs *CheckoutSession) Step5PollReceipt(receiptID string) (bool, string, map
 
 		switch rType {
 		case "ProcessedReceipt":
-			fmt.Println("  [SUCCESS] Order completed (ProcessedReceipt)")
+			fmt.Println("  Order completed (ProcessedReceipt)")
 			return true, "SUCCESS", response
 
 		case "ActionRequiredReceipt":
-			fmt.Println("  [ACTION REQUIRED] 3-D Secure or other action required")
+			fmt.Println("  3-D Secure or action required")
 			return false, `"code": "ACTION_REQUIRED"`, response
 
 		case "FailedReceipt":
-			fmt.Println("  [FAILED] FailedReceipt")
 			code := extractFailureCode(receipt)
+			fmt.Printf("  FailedReceipt: %s\n", code)
 			return false, code, response
 
 		case "ProcessingReceipt", "":
@@ -689,7 +1537,7 @@ func (cs *CheckoutSession) Step5PollReceipt(receiptID string) (bool, string, map
 			if waitSec > cfg.MaxWaitSeconds {
 				waitSec = cfg.MaxWaitSeconds
 			}
-			fmt.Printf("  [INFO] Still processing; waiting %.2fs\n", waitSec)
+			fmt.Printf("  Processing... (%.1fs)\n", waitSec)
 			time.Sleep(time.Duration(waitSec * float64(time.Second)))
 
 		default:
@@ -697,401 +1545,14 @@ func (cs *CheckoutSession) Step5PollReceipt(receiptID string) (bool, string, map
 		}
 	}
 
-	fmt.Println("  [TIMEOUT] Poll attempts exhausted")
+	fmt.Println("  Poll timeout")
 	if lastResponse != nil {
 		return false, `"code": "UNKNOWN"`, lastResponse
 	}
 	return false, `"code": "TIMEOUT"`, nil
 }
 
-// ─── Proposal payload builder ────────────────────────────────────────────────
-
-func (cs *CheckoutSession) buildProposalPayload(query string, shippingHandle string, stableID string, forPoll bool) map[string]any {
-	deliveryLine := cs.buildDeliveryLine(shippingHandle, stableID, false, true, forPoll)
-
-	deliveryBlock := map[string]any{
-		"deliveryLines":      []any{deliveryLine},
-		"noDeliveryRequired": []any{},
-	}
-	// Polls include supportsSplitShipping (matches Python poll functions)
-	if forPoll {
-		deliveryBlock["supportsSplitShipping"] = true
-	}
-
-	// Core 7 variables (sent for BOTH initial Step 3 AND polls)
-	vars := map[string]any{
-		"delivery":      deliveryBlock,
-		"discounts":     map[string]any{"lines": []any{}, "acceptUnexpectedDiscounts": true},
-		"payment":       map[string]any{"totalAmount": map[string]any{"any": true}, "paymentLines": []any{}, "billingAddress": map[string]any{"streetAddress": cs.billingAddress()}},
-		"merchandise":   cs.merchandiseBlock(forPoll),
-		"buyerIdentity": cs.buyerIdentity(),
-		"taxes":         map[string]any{"proposedTotalAmount": map[string]any{"any": true}},
-		"sessionInput":  map[string]any{"sessionToken": cs.SessionToken},
-	}
-
-	// Extra 6 variables ONLY for polls (matches Python: step3_proposal_ctx sends 7, polls send 13)
-	if forPoll {
-		vars["tip"] = map[string]any{"tipLines": []any{}}
-		vars["note"] = map[string]any{"message": nil, "customAttributes": []any{}}
-		vars["scriptFingerprint"] = map[string]any{
-			"signature": nil, "signatureUuid": nil,
-			"lineItemScriptChanges": []any{}, "paymentScriptChanges": []any{}, "shippingScriptChanges": []any{},
-		}
-		vars["optionalDuties"] = map[string]any{"buyerRefusesDuties": false}
-		vars["cartMetafields"] = []any{}
-		vars["memberships"] = map[string]any{"memberships": []any{}}
-	}
-
-	return map[string]any{
-		"operationName": "Proposal",
-		"query":         query,
-		"variables":     vars,
-	}
-}
-
-func (cs *CheckoutSession) buildDeliveryLine(handle string, stableID string, useFull bool, phoneRequired bool, forPoll bool) map[string]any {
-	addrKey := "partialStreetAddress"
-	if useFull {
-		addrKey = "streetAddress"
-	}
-
-	addrData := map[string]any{
-		"address1":    cs.Addr.Address1,
-		"city":        cs.Addr.City,
-		"countryCode": cs.Addr.Country,
-		"firstName":   cs.Addr.FirstName,
-		"lastName":    cs.Addr.LastName,
-		"zoneCode":    cs.Addr.Province,
-		"postalCode":  cs.Addr.Zip,
-		"phone":       cs.Addr.Phone,
-	}
-	// Polls include oneTimeUse in partial address (matches Python inline poll delivery line)
-	if forPoll && !useFull {
-		addrData["oneTimeUse"] = false
-	}
-
-	// Only use stableID when explicitly provided; step3 initial uses {"any": true}
-	targetLines := map[string]any{"any": true}
-	if stableID != "" {
-		targetLines = map[string]any{"lines": []any{map[string]any{"stableId": stableID}}}
-	}
-
-	strategy := map[string]any{
-		"deliveryStrategyByHandle": map[string]any{
-			"handle":             handle,
-			"customDeliveryRate": false,
-		},
-	}
-	// Non-poll calls include phone options (matches Python get_delivery_line_config)
-	if phoneRequired && !forPoll {
-		strategy["options"] = map[string]any{"phone": cs.Addr.Phone}
-	}
-
-	line := map[string]any{
-		"destination":              map[string]any{addrKey: addrData},
-		"targetMerchandiseLines":   targetLines,
-		"deliveryMethodTypes":      []string{"SHIPPING"},
-		"selectedDeliveryStrategy": strategy,
-		"expectedTotalPrice":       map[string]any{"any": true},
-	}
-	// Polls include destinationChanged: false (matches Python inline poll delivery line)
-	if forPoll {
-		line["destinationChanged"] = false
-	}
-
-	return line
-}
-
-func (cs *CheckoutSession) merchandiseBlock(forPoll bool) map[string]any {
-	pvRef := map[string]any{
-		"id":         fmt.Sprintf("gid://shopify/ProductVariantMerchandise/%s", cs.VariantID),
-		"variantId":  fmt.Sprintf("gid://shopify/ProductVariant/%s", cs.VariantID),
-		"properties": []any{},
-	}
-	// Only polls include sellingPlanId (matches Python poll_for_delivery_and_expectations_ctx)
-	if forPoll {
-		pvRef["sellingPlanId"] = nil
-	}
-
-	lineItem := map[string]any{
-		"stableId":           cs.MerchandiseID,
-		"merchandise":        map[string]any{"productVariantReference": pvRef},
-		"quantity":           map[string]any{"items": map[string]any{"value": 1}},
-		"expectedTotalPrice": map[string]any{"any": true},
-	}
-	// Only polls include lineComponents (matches Python poll_for_delivery_and_expectations_ctx)
-	if forPoll {
-		lineItem["lineComponents"] = []any{}
-	}
-
-	return map[string]any{
-		"merchandiseLines": []any{lineItem},
-	}
-}
-
-func (cs *CheckoutSession) buyerIdentity() map[string]any {
-	currency := "USD"
-	if cs.CurrencyCode != "" {
-		currency = cs.CurrencyCode
-	}
-	return map[string]any{
-		"customer": map[string]any{"presentmentCurrency": currency, "countryCode": cs.Addr.Country},
-		"email":    cs.Addr.Email,
-	}
-}
-
-// buyerIdentitySubmit returns buyer identity with phone fields for Step 4 (SubmitForCompletion)
-func (cs *CheckoutSession) buyerIdentitySubmit() map[string]any {
-	currency := "USD"
-	if cs.CurrencyCode != "" {
-		currency = cs.CurrencyCode
-	}
-	bi := map[string]any{
-		"customer": map[string]any{"presentmentCurrency": currency, "countryCode": cs.Addr.Country},
-		"email":    cs.Addr.Email,
-	}
-	if cs.Addr.Phone != "" {
-		bi["phoneCountryCode"] = cs.Addr.Country
-		bi["shopPayOptInPhone"] = map[string]any{
-			"number":      cs.Addr.Phone,
-			"countryCode": cs.Addr.Country,
-		}
-	}
-	return bi
-}
-
-func (cs *CheckoutSession) billingAddress() map[string]any {
-	return map[string]any{
-		"address1":    cs.Addr.Address1,
-		"city":        cs.Addr.City,
-		"countryCode": cs.Addr.Country,
-		"postalCode":  cs.Addr.Zip,
-		"firstName":   cs.Addr.FirstName,
-		"lastName":    cs.Addr.LastName,
-		"zoneCode":    cs.Addr.Province,
-		"phone":       cs.Addr.Phone,
-	}
-}
-
-// ─── Polling helpers ─────────────────────────────────────────────────────────
-
-func (cs *CheckoutSession) pollFullDelivery() {
-	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=Proposal"
-
-	for attempt := range 5 {
-		fmt.Printf("  [POLL] Full delivery attempt %d/5...\n", attempt+1)
-
-		payload := cs.buildProposalPayload(ProposalFullQuery, cs.ShippingHandle, cs.MerchandiseID, true)
-		if cs.ShippingHandle == "" {
-			payload = cs.buildProposalPayload(ProposalFullQuery, "any", cs.MerchandiseID, true)
-		}
-		payloadBytes, _ := json.Marshal(addAPQExtensions(payload))
-
-		req, _ := http.NewRequest("POST", gqlURL, bytes.NewReader(payloadBytes))
-		req.Header = cs.graphqlHeaders()
-		resp, err := cs.Client.Do(req)
-		if err != nil {
-			time.Sleep(cfg.ShortSleep)
-			continue
-		}
-		decompressBody(resp)
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			time.Sleep(cfg.ShortSleep)
-			continue
-		}
-
-		var response map[string]any
-		json.Unmarshal(body, &response)
-
-		result := navigateMap(response, "data", "session", "negotiate", "result")
-		if getString(result, "__typename") != "NegotiationResultAvailable" {
-			time.Sleep(cfg.ShortSleep)
-			continue
-		}
-
-		qt := getString(result, "queueToken")
-		if qt != "" {
-			cs.QueueToken = qt
-		}
-
-		sp := getMap(result, "sellerProposal")
-
-		// Extract shipping
-		dt := getMap(sp, "delivery")
-		if getString(dt, "__typename") == "FilledDeliveryTerms" {
-			cs.extractShipping(dt)
-		}
-
-		// Extract total
-		cs.extractTotal(sp)
-
-		// Extract expectations
-		cs.extractDeliveryExpectations(sp)
-
-		if cs.ShippingHandle != "" && len(cs.DeliveryExps) > 0 && cs.ActualTotal != "" {
-			fmt.Printf("  [POLL] ✓ Complete! Handle: %s, Total: $%s\n", truncate(cs.ShippingHandle, 30), cs.ActualTotal)
-			return
-		}
-
-		// Wait based on poll delay
-		waitSec := min(0.5, cfg.MaxWaitSeconds)
-		if getString(dt, "__typename") == "PendingTerms" {
-			delay := getFloat(dt, "pollDelay")
-			if delay > 0 {
-				waitSec = min(delay/1000.0, cfg.MaxWaitSeconds)
-			}
-		}
-		time.Sleep(time.Duration(waitSec * float64(time.Second)))
-	}
-}
-
-func (cs *CheckoutSession) pollExpectations() {
-	gqlURL := cs.ShopURL + "/checkouts/unstable/graphql?operationName=Proposal"
-
-	for attempt := range 5 {
-		fmt.Printf("  [POLL] Expectations attempt %d/5...\n", attempt+1)
-
-		payload := cs.buildProposalPayload(ProposalPollQuery, cs.ShippingHandle, cs.MerchandiseID, true)
-		payloadBytes, _ := json.Marshal(addAPQExtensions(payload))
-
-		req, _ := http.NewRequest("POST", gqlURL, bytes.NewReader(payloadBytes))
-		req.Header = cs.graphqlHeaders()
-		resp, err := cs.Client.Do(req)
-		if err != nil {
-			time.Sleep(cfg.ShortSleep)
-			continue
-		}
-		decompressBody(resp)
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			time.Sleep(cfg.ShortSleep)
-			continue
-		}
-
-		var response map[string]any
-		json.Unmarshal(body, &response)
-
-		result := navigateMap(response, "data", "session", "negotiate", "result")
-		sp := getMap(result, "sellerProposal")
-		expTerms := getMap(sp, "deliveryExpectations")
-
-		if getString(expTerms, "__typename") == "FilledDeliveryExpectationTerms" {
-			exps := getSlice(expTerms, "deliveryExpectations")
-			cs.DeliveryExps = nil
-			for _, e := range exps {
-				em, _ := e.(map[string]any)
-				sh := getString(em, "signedHandle")
-				if sh != "" {
-					cs.DeliveryExps = append(cs.DeliveryExps, map[string]string{"signedHandle": sh})
-				}
-			}
-			qt := getString(result, "queueToken")
-			if qt != "" {
-				cs.QueueToken = qt
-			}
-			fmt.Printf("  [POLL] ✓ Got %d expectations\n", len(cs.DeliveryExps))
-			return
-		}
-
-		if getString(expTerms, "__typename") == "PendingTerms" {
-			delay := getFloat(expTerms, "pollDelay")
-			if delay == 0 {
-				delay = 2000
-			}
-			waitSec := min(delay/1000.0, cfg.MaxWaitSeconds)
-			time.Sleep(time.Duration(waitSec * float64(time.Second)))
-		} else {
-			time.Sleep(cfg.ShortSleep)
-		}
-	}
-}
-
-// ─── Extraction helpers ──────────────────────────────────────────────────────
-
-func (cs *CheckoutSession) extractShipping(deliveryTerms map[string]any) {
-	lines := getSlice(deliveryTerms, "deliveryLines")
-	if len(lines) == 0 {
-		return
-	}
-	firstLine, _ := lines[0].(map[string]any)
-	strategies := getSlice(firstLine, "availableDeliveryStrategies")
-	if len(strategies) == 0 {
-		return
-	}
-	first, _ := strategies[0].(map[string]any)
-	cs.ShippingHandle = getString(first, "handle")
-	amtConstraint := getMap(first, "amount")
-	if getString(amtConstraint, "__typename") == "MoneyValueConstraint" {
-		cs.ShippingAmount = getString(getMap(amtConstraint, "value"), "amount")
-	}
-	if cs.ShippingHandle != "" {
-		fmt.Printf("  [OK] Shipping handle: %s\n", truncate(cs.ShippingHandle, 50))
-	}
-}
-
-func (cs *CheckoutSession) extractTotal(sellerProposal map[string]any) {
-	// Try runningTotal first (newer API), then checkoutTotal
-	for _, key := range []string{"runningTotal", "checkoutTotal"} {
-		ct := getMap(sellerProposal, key)
-		if getString(ct, "__typename") == "MoneyValueConstraint" {
-			v := getMap(ct, "value")
-			amt := getString(v, "amount")
-			curr := getString(v, "currencyCode")
-			if amt != "" {
-				cs.ActualTotal = amt
-				if curr != "" {
-					cs.CurrencyCode = curr
-				}
-				fmt.Printf("  [OK] Total: %s %s\n", amt, cs.CurrencyCode)
-				return
-			}
-		}
-	}
-}
-
-func (cs *CheckoutSession) extractDeliveryExpectations(sellerProposal map[string]any) {
-	expTerms := getMap(sellerProposal, "deliveryExpectations")
-	if getString(expTerms, "__typename") == "FilledDeliveryExpectationTerms" {
-		exps := getSlice(expTerms, "deliveryExpectations")
-		cs.DeliveryExps = nil
-		for _, e := range exps {
-			em, _ := e.(map[string]any)
-			sh := getString(em, "signedHandle")
-			if sh != "" {
-				cs.DeliveryExps = append(cs.DeliveryExps, map[string]string{"signedHandle": sh})
-			}
-		}
-		fmt.Printf("  [OK] Found %d expectations\n", len(cs.DeliveryExps))
-	}
-}
-
-func (cs *CheckoutSession) detectPhoneRequired(sellerProposal map[string]any) bool {
-	deliveryTerms := getMap(sellerProposal, "delivery")
-	if getString(deliveryTerms, "__typename") != "FilledDeliveryTerms" {
-		return true // default to true for safety
-	}
-	lines := getSlice(deliveryTerms, "deliveryLines")
-	for _, l := range lines {
-		lm, _ := l.(map[string]any)
-		strategies := getSlice(lm, "availableDeliveryStrategies")
-		for _, s := range strategies {
-			sm, _ := s.(map[string]any)
-			if getBool(sm, "phoneRequired") {
-				fmt.Println("  [DETECT] ✓ Phone number IS required")
-				return true
-			}
-		}
-	}
-	fmt.Println("  [DETECT] Phone number NOT required")
-	return false
-}
-
-// ─── HTML extraction helpers ─────────────────────────────────────────────────
+// ─── Session token extraction (multiple patterns) ────────────────────────────
 
 var sessionTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`<meta\s+name="serialized-sessionToken"\s+content="([^"]+)"`),
@@ -1101,9 +1562,9 @@ var sessionTokenPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)sessionToken["'\s]*:\s*["']([^"']+)["']`),
 }
 
-func extractSessionToken(html string) string {
+func extractSessionToken(checkoutHTML string) string {
 	for _, re := range sessionTokenPatterns {
-		m := re.FindStringSubmatch(html)
+		m := re.FindStringSubmatch(checkoutHTML)
 		if m != nil && len(m[1]) > 50 {
 			token := strings.Trim(m[1], `"'`)
 			return htmlUnescape(token)
@@ -1112,21 +1573,25 @@ func extractSessionToken(html string) string {
 	return ""
 }
 
+// ─── Build ID extraction (fallback for commitSha) ───────────────────────────
+
 var buildIDPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`/_next/static/([a-zA-Z0-9_-]{8,64})/_buildManifest\.js`),
 	regexp.MustCompile(`"buildId"\s*:\s*"([a-zA-Z0-9_-]{8,64})"`),
 	regexp.MustCompile(`/_next/static/([a-zA-Z0-9_-]{8,64})/`),
 }
 
-func extractBuildID(html string) string {
+func extractBuildID(checkoutHTML string) string {
 	for _, re := range buildIDPatterns {
-		m := re.FindStringSubmatch(html)
+		m := re.FindStringSubmatch(checkoutHTML)
 		if m != nil {
 			return m[1]
 		}
 	}
 	return ""
 }
+
+// ─── Failure code extraction ─────────────────────────────────────────────────
 
 func extractFailureCode(receipt map[string]any) string {
 	pe := getMap(receipt, "processingError")
@@ -1137,7 +1602,7 @@ func extractFailureCode(receipt map[string]any) string {
 	return "UNKNOWN"
 }
 
-// ─── Utility helpers ─────────────────────────────────────────────────────────
+// ─── Map / JSON navigation helpers ───────────────────────────────────────────
 
 func navigateMap(m map[string]any, keys ...string) map[string]any {
 	current := m
@@ -1174,7 +1639,6 @@ func getString(m map[string]any, key string) string {
 	if ok {
 		return s
 	}
-	// Handle json.Number
 	if n, ok := v.(json.Number); ok {
 		return n.String()
 	}
@@ -1219,6 +1683,8 @@ func getSlice(m map[string]any, key string) []any {
 	}
 	return v
 }
+
+// ─── String helpers ──────────────────────────────────────────────────────────
 
 func truncate(s string, n int) string {
 	if len(s) <= n {
